@@ -23,6 +23,9 @@ POLICIES=${POLICIES:-"P D V H-D I"}
 SWAP_POLICIES=${SWAP_POLICIES:-"S V"}
 
 mkdir -p "$OUT"
+# Run from a neutral dir so the old vendored vllm/ in mars-codebase can't shadow
+# the installed vLLM (mars.bench.run also strips cwd from sys.path defensively).
+cd "$OUT"
 
 run() {  # api_policy [extra args...]
   local pol="$1"; shift

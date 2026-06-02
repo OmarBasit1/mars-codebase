@@ -24,6 +24,14 @@ import random
 import time
 from dataclasses import dataclass
 
+# Drop cwd from sys.path BEFORE importing vllm: launching from mars-codebase
+# (which still contains the old vendored vLLM 0.2.0 under vllm/) would otherwise
+# shadow the installed vLLM. Must run before the vllm imports below.
+import os
+import sys
+
+sys.path = [p for p in sys.path if p not in ("", os.getcwd())]
+
 import numpy as np
 
 from vllm.engine.arg_utils import AsyncEngineArgs
