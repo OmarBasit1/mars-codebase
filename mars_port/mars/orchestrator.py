@@ -18,6 +18,7 @@ KV-cache policy decision at the pause point inside ``MARSScheduler``.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -61,6 +62,10 @@ class OrchestratorResult:
     pauses: int = 0
     total_generated: int = 0
     segment_tokens: list[list[int]] = field(default_factory=list)
+    # Timing (perf_counter seconds), for the benchmark harness.
+    start_time: float = 0.0
+    first_token_time: float = 0.0
+    end_time: float = 0.0
 
 
 class ApiOrchestrator:
@@ -132,6 +137,7 @@ class ApiOrchestrator:
         result = OrchestratorResult(
             request_id=request_id, segment_tokens=[[] for _ in range(n)]
         )
+        result.start_time = time.perf_counter()
 
         async def input_stream():
             # Initial segment: the real prompt.
@@ -146,7 +152,9 @@ class ApiOrchestrator:
                 seg = segments[i]
                 if simulate and seg.api_exec_time > 0:
                     await asyncio.sleep(seg.api_exec_time)  # simulated API latency
-                api_tokens = [self.api_result_token] * seg.api_return_length
+                # At least one token: the engine rejects empty prompts, so an
+                # API that returns nothing still injects a single resume marker.
+                api_tokens = [self.api_result_token] * max(1, seg.api_return_length)
                 # Inject the API result + params for the next segment; the engine
                 # folds prior output into the prompt, appends these, and resumes.
                 yield StreamingInput(
@@ -163,6 +171,8 @@ class ApiOrchestrator:
         async for out in self.engine.generate(input_stream(), base_sp, request_id):
             if out.outputs:
                 toks = list(out.outputs[0].token_ids)  # DELTA: new tokens only
+                if toks and result.first_token_time == 0.0:
+                    result.first_token_time = time.perf_counter()
                 result.segment_tokens[seg_idx].extend(toks)
                 seg_count += len(toks)
                 result.total_generated += len(toks)
@@ -175,4 +185,5 @@ class ApiOrchestrator:
                 proceed.put_nowait(True)
             if out.finished:
                 result.finished = True
+        result.end_time = time.perf_counter()
         return result
