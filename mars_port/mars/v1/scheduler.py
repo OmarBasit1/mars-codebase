@@ -30,6 +30,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from mars.config import MarsConfig
+from mars.cost_model import CostModel, CostModelCoeffs
 from mars.params import MarsApiParams
 from mars.policies import PauseMode, decide_pause_mode
 
@@ -58,16 +59,34 @@ class MARSScheduler(Scheduler):
         self.mars_state: dict[str, _MarsReqState] = {}
         # Swap is only real once a CPU-offload KV connector is configured (Phase 6).
         self._swap_available = self.connector is not None
+        self._block_size = getattr(self.cache_config, "block_size", None) or 16
+        # Cost model for the adaptive 'V' (Vulcan) policy.
+        self.cost_model = CostModel(
+            CostModelCoeffs(
+                a=self.mars_config.cost_a,
+                c=self.mars_config.cost_c,
+                max_ragged_batch=self.mars_config.cost_max_ragged_batch,
+                block_size=self._block_size,
+            )
+        )
+        # chunk-fill (simplified): cap the per-step token budget so paused
+        # (preserved) KV plus new work fit. Full dynamic chunk-fill is Phase 6.
+        if self.mars_config.chunk_fill and self.mars_config.chunk_size > 0:
+            self.max_num_scheduled_tokens = min(
+                self.max_num_scheduled_tokens, self.mars_config.chunk_size
+            )
         # Observability counters (read by tests / logged).
         self.mars_total_pauses = 0
         self.mars_preserve_count = 0
         self.mars_recompute_count = 0
         logger.info(
             "[MARS] scheduler active: api_policy=%s policy_config=%s "
-            "swap_available=%s",
+            "swap_available=%s block_size=%s chunk_fill=%s",
             self.mars_config.api_policy,
             self.mars_config.policy_config,
             self._swap_available,
+            self._block_size,
+            self.mars_config.chunk_fill,
         )
 
     # --- policy resolution -------------------------------------------------
@@ -97,11 +116,7 @@ class MARSScheduler(Scheduler):
         st.pauses += 1
         self.mars_total_pauses += 1
 
-        mode = decide_pause_mode(
-            st.policy_letter,
-            swap_available=self._swap_available,
-            swap_fallback=self.mars_config.swap_fallback,
-        )
+        mode, detail = self._decide_pause_mode(request, st.policy_letter)
         if mode is PauseMode.RECOMPUTE:
             # Free the paused request's KV now (idempotent: req_to_blocks.pop).
             # num_computed_tokens is left intact so the resume-fold can still
@@ -110,18 +125,62 @@ class MARSScheduler(Scheduler):
             st.pending_recompute_reset = True
             self.mars_recompute_count += 1
             logger.info(
-                "[MARS] pause req=%s policy=%s mode=recompute (freed KV)",
+                "[MARS] pause req=%s policy=%s mode=recompute (freed KV)%s",
                 request.request_id,
                 st.policy_letter,
+                detail,
             )
         else:
             # PRESERVE: keep blocks resident; nothing to do.
             self.mars_preserve_count += 1
             logger.info(
-                "[MARS] pause req=%s policy=%s mode=preserve (kept KV)",
+                "[MARS] pause req=%s policy=%s mode=preserve (kept KV)%s",
                 request.request_id,
                 st.policy_letter,
+                detail,
             )
+
+    def _decide_pause_mode(self, request: Request, policy_letter: str):
+        """Resolve the concrete pause mode (and a log detail string).
+
+        Direct policies (P/D/S) map straight through; the adaptive 'V' (Vulcan)
+        policy chooses Preserve vs Recompute via the 2-way cost model.
+        """
+        if policy_letter == "V":
+            return self._vulcan_decision(request)
+        mode = decide_pause_mode(
+            policy_letter,
+            swap_available=self._swap_available,
+            swap_fallback=self.mars_config.swap_fallback,
+        )
+        return mode, ""
+
+    def _vulcan_decision(self, request: Request):
+        """2-way Vulcan: pick Preserve vs Recompute by the cost model.
+
+        Uses the request's *actual* current length (known at the pause) and the
+        current running-batch state as the recompute-contention context.
+        """
+        bs = self._block_size
+        mp = MarsApiParams.from_sampling_params(request.sampling_params)
+        api_exec_time = mp.predicted_api_exec_time if mp is not None else 1.0
+        num_blocks = max(1, (request.num_tokens + bs - 1) // bs)
+        before_api_tokens = num_blocks * bs
+        # Competition for GPU during a recompute = the other running requests.
+        running_batch = sum(
+            max(1, r.num_tokens - r.num_computed_tokens) for r in self.running
+        )
+        running_blocks = sum(
+            (r.num_computed_tokens + bs - 1) // bs for r in self.running
+        )
+        mode, w_p, w_d = self.cost_model.choose_2way(
+            api_exec_time=api_exec_time,
+            before_api_tokens=before_api_tokens,
+            num_blocks=num_blocks,
+            running_batch=running_batch,
+            running_blocks=running_blocks,
+        )
+        return mode, f" w_p={w_p:.4g} w_d={w_d:.4g}"
 
     # --- resume hook -------------------------------------------------------
 

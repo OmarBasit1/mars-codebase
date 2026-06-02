@@ -54,6 +54,13 @@ class MarsConfig:
     starvation_threshold: int = 0
     starvation_quantum: int = 0
     recompute_skip_prefix_cache: bool = True
+    # Cost-model coefficients for the adaptive 'V' (Vulcan) policy. Defaults are
+    # the original MARS values; re-tune per model/GPU via examples/calibrate_cost.py
+    # (the forward-step time model is ~ (cost_a * batch_tokens + cost_c) ms, and
+    # cost_max_ragged_batch is the tokens/step where compute saturates).
+    cost_a: float = 0.0463
+    cost_c: float = 10.0
+    cost_max_ragged_batch: int = 384
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "MarsConfig":
