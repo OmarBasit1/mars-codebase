@@ -32,7 +32,14 @@ from vllm.v1.request import Request, RequestStatus
 from mars.config import MarsConfig
 from mars.cost_model import CostModel, CostModelCoeffs
 from mars.params import MarsApiParams
-from mars.policies import PauseMode, decide_pause_mode
+from mars.policies import (
+    THRESHOLD_POLICIES,
+    PauseMode,
+    decide_pause_mode,
+    decide_threshold_mode,
+    degrade_swap,
+)
+from mars.v1.queue import MARSRequestQueue
 
 # Name under the "vllm" namespace so MARS logs inherit vLLM's log handler
 # (vLLM configures a handler on the "vllm" logger only, propagate=False).
@@ -75,6 +82,10 @@ class MARSScheduler(Scheduler):
             self.max_num_scheduled_tokens = min(
                 self.max_num_scheduled_tokens, self.mars_config.chunk_size
             )
+        # Waiting-queue ordering: SJF replaces the native FCFS waiting queue
+        # (the queue is empty at construction time, so swapping is safe).
+        if self.mars_config.policy_config == "sjf":
+            self.waiting = MARSRequestQueue()
         # Observability counters (read by tests / logged).
         self.mars_total_pauses = 0
         self.mars_preserve_count = 0
@@ -148,6 +159,25 @@ class MARSScheduler(Scheduler):
         """
         if policy_letter == "V":
             return self._vulcan_decision(request)
+        if policy_letter in THRESHOLD_POLICIES:
+            mp = MarsApiParams.from_sampling_params(request.sampling_params)
+            api_exec_time = mp.api_exec_time if mp is not None else 1.0
+            mode = decide_threshold_mode(
+                policy_letter,
+                api_exec_time=api_exec_time,
+                heuristic_coef=self.mars_config.heuristic_coef,
+            )
+            mode = degrade_swap(
+                mode,
+                swap_available=self._swap_available,
+                swap_fallback=self.mars_config.swap_fallback,
+            )
+            return mode, f" api_t={api_exec_time:g}"
+        if policy_letter in ("G", "I"):
+            # Static behavior == PRESERVE. The dynamic memory-pressure demotion
+            # (Greedy / InferCept) is the chunk-fill machinery -> Phase 6.
+            return PauseMode.PRESERVE, " (static; dynamic->P6)"
+        # Direct P / D / S.
         mode = decide_pause_mode(
             policy_letter,
             swap_available=self._swap_available,
