@@ -23,6 +23,7 @@ produce identical output tokens (verified by the Phase 3 smoke test).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
@@ -39,7 +40,8 @@ from mars.policies import (
     decide_threshold_mode,
     degrade_swap,
 )
-from mars.v1.queue import MARSRequestQueue
+from mars.v1.queue import make_mars_queue
+from mars.v1.solver import GUROBI_AVAILABLE, MarsSolver, SolverParams, split_to_mode
 
 # Name under the "vllm" namespace so MARS logs inherit vLLM's log handler
 # (vLLM configures a handler on the "vllm" logger only, propagate=False).
@@ -88,16 +90,43 @@ class MARSScheduler(Scheduler):
                 swap_c=self.mars_config.cost_swap_c,
             )
         )
+        # Optional Gurobi solver for 'V' (decision-only): falls back to the
+        # greedy cost model when unavailable.
+        self.solver: MarsSolver | None = None
+        if self.mars_config.use_solver:
+            if GUROBI_AVAILABLE:
+                self.solver = MarsSolver(
+                    SolverParams(
+                        block_size=self._block_size,
+                        target=self.mars_config.solver_target,
+                        timeout=self.mars_config.solver_timeout,
+                        free_swap_tokens=self.mars_config.solver_free_swap_tokens,
+                        per_token_swap_latency=self.mars_config.solver_per_token_swap_latency,
+                        poly_a=self.mars_config.solver_poly_a,
+                        poly_b=self.mars_config.solver_poly_b,
+                        poly_c=self.mars_config.solver_poly_c,
+                    )
+                )
+            else:
+                logger.warning(
+                    "[MARS] use_solver set but gurobipy unavailable; "
+                    "falling back to the greedy cost model."
+                )
         # chunk-fill (simplified): cap the per-step token budget so paused
         # (preserved) KV plus new work fit. Full dynamic chunk-fill is Phase 6.
         if self.mars_config.chunk_fill and self.mars_config.chunk_size > 0:
             self.max_num_scheduled_tokens = min(
                 self.max_num_scheduled_tokens, self.mars_config.chunk_size
             )
-        # Waiting-queue ordering: SJF replaces the native FCFS waiting queue
-        # (the queue is empty at construction time, so swapping is safe).
-        if self.mars_config.policy_config == "sjf":
-            self.waiting = MARSRequestQueue()
+        # Starvation tracking (shared with the MARS queues so boosted requests
+        # sort to the front via key -inf).
+        self.mars_starving: set[str] = set()
+        self.mars_wait_counter: dict[str, int] = {}
+        # Waiting-queue ordering: SJF / V2 replace the native FCFS queue (it is
+        # empty at construction time, so swapping is safe).
+        mars_queue = make_mars_queue(self.mars_config.policy_config, self.mars_starving)
+        if mars_queue is not None:
+            self.waiting = mars_queue
         # Observability counters (read by tests / logged).
         self.mars_total_pauses = 0
         self.mars_preserve_count = 0
@@ -193,10 +222,10 @@ class MARSScheduler(Scheduler):
             via :meth:`_vulcan_decision`.
           * ``H``/``H-S``/``H-D``/``H-B`` -> ``api_exec_time`` threshold
             heuristics (swap arms degraded when swap is unavailable).
-          * ``G``/``I`` -> their *static* pause mode (PRESERVE). NOTE: partial by
-            design -- the dynamic memory-pressure demotion that distinguishes
-            Greedy / InferCept is the chunk-fill machinery and is deferred (a
-            Phase-6 follow-up); once added, G and I will need to diverge here.
+          * ``G``/``I`` -> their *static* pause mode (PRESERVE) here; the dynamic
+            memory-pressure demotion that distinguishes Greedy / InferCept runs
+            in :meth:`schedule` (``_mars_demote_under_pressure``), where ``I``
+            demotes recompute-only and ``G`` is swap-aware.
           * ``P``/``D``/``S`` -> direct mode (swap degraded when unavailable).
         """
         if policy_letter == "V":
@@ -216,9 +245,9 @@ class MARSScheduler(Scheduler):
             )
             return mode, f" api_t={api_exec_time:g}"
         if policy_letter in ("G", "I"):
-            # Static behavior == PRESERVE. The dynamic memory-pressure demotion
-            # (Greedy / InferCept) is the chunk-fill machinery -> Phase 6.
-            return PauseMode.PRESERVE, " (static; dynamic->P6)"
+            # Static pause mode is PRESERVE; the dynamic demotion that makes
+            # Greedy / InferCept distinct runs in schedule() under memory pressure.
+            return PauseMode.PRESERVE, " (static; demote under pressure)"
         # Direct P / D / S.
         mode = decide_pause_mode(
             policy_letter,
@@ -245,6 +274,29 @@ class MARSScheduler(Scheduler):
         running_blocks = sum(
             (r.num_computed_tokens + bs - 1) // bs for r in self.running
         )
+        # Solver path (decision-only): solve the optimal KV split and apply the
+        # dominant whole-request mode; fall back to the greedy choice on failure.
+        if self.solver is not None:
+            res = self.solver.solve_blocks(
+                num_tokens=request.num_tokens,
+                num_active_gpu_blocks=running_blocks,
+                api_exec_time=api_exec_time,
+                api_return_length=(mp.api_return_length if mp is not None else 0),
+                arrival_time=request.arrival_time,
+                now=time.time(),
+                running_query_head=running_batch,
+                running_query_tail=running_batch,
+                swap_in_chunks_head=self.solver.free_swap,
+                swap_in_chunks_tail=self.solver.free_swap,
+            )
+            if res is not None:
+                c_s, c_d, n_e = res
+                mode, _ = split_to_mode(
+                    c_s, c_d, n_e, num_blocks,
+                    swap_available=self._swap_available,
+                    swap_fallback=self.mars_config.swap_fallback,
+                )
+                return mode, f" solver(c_s={c_s},c_d={c_d},n_e={n_e})"
         mode, wastes = self.cost_model.choose(
             api_exec_time=api_exec_time,
             before_api_tokens=before_api_tokens,
@@ -264,14 +316,59 @@ class MARSScheduler(Scheduler):
     # --- dynamic memory-pressure demotion ---------------------------------
 
     def schedule(self):
-        # Before the base scheduler admits/preempts, free the cheapest
-        # preserved-paused KV under memory pressure so waiting work can run.
+        # Pre-pass before the base scheduler admits/preempts:
+        #  1. starvation — boost long-waiting requests to the front;
+        #  2. demotion — free the cheapest preserved-paused KV under pressure.
+        if self.mars_config.starvation_avoidance:
+            self._mars_starvation_pass()
+        # chunk_fill (the original's switch for the demotion machinery) or the
+        # explicit demote_under_pressure knob enables dynamic demotion.
         if (
-            self.mars_config.demote_under_pressure
+            (self.mars_config.demote_under_pressure or self.mars_config.chunk_fill)
             and len(self.mars_paused_preserved) > 1
         ):
             self._mars_demote_under_pressure()
         return super().schedule()
+
+    def _mars_starvation_pass(self) -> None:
+        """Boost requests that have waited too long to the front of the queue.
+
+        Each step, increment a wait counter for every request still in
+        ``self.waiting``; once it exceeds ``starvation_threshold`` the request is
+        marked *starving* (key ``-inf`` in the MARS queues) and moved to the
+        front, where it stays until scheduled (the original's ``quantum`` is
+        treated as "boosted until scheduled"). FCFS uses ``prepend_request``.
+        """
+        threshold = self.mars_config.starvation_threshold
+        waiting_ids: set[str] = set()
+        boosted = 0
+        for req in list(self.waiting):
+            rid = req.request_id
+            waiting_ids.add(rid)
+            if rid in self.mars_starving:
+                continue
+            count = self.mars_wait_counter.get(rid, 0) + 1
+            self.mars_wait_counter[rid] = count
+            if count > threshold:
+                self.mars_starving.add(rid)
+                self._mars_boost(req)
+                boosted += 1
+        # Drop bookkeeping for requests that left the waiting queue (scheduled).
+        for rid in list(self.mars_wait_counter):
+            if rid not in waiting_ids:
+                self.mars_wait_counter.pop(rid, None)
+                self.mars_starving.discard(rid)
+        if boosted:
+            logger.info("[MARS] starvation: boosted %d request(s) to front", boosted)
+
+    def _mars_boost(self, request: Request) -> None:
+        try:
+            self.waiting.remove_request(request)
+        except (ValueError, KeyError):
+            return
+        # FCFS deque -> appendleft (front); MARS heap -> re-add with key -inf
+        # (the request is already in mars_starving at this point).
+        self.waiting.prepend_request(request)
 
     def _mars_demote_under_pressure(self) -> None:
         # Act only with pending admission demand and real KV pressure.

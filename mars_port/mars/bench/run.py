@@ -95,21 +95,29 @@ async def main_async(args: argparse.Namespace) -> None:
     workload = json.load(open(args.workload))
     keys = list(workload.keys())
     random.seed(args.seed)
-    selected = random.choices(keys, k=args.num_requests)
+    # --window W (seconds) derives the request count from the arrival rate, like
+    # the original benchmark; otherwise use --num-requests directly.
+    num_requests = max(1, int(args.qps * args.window)) if args.window > 0 else args.num_requests
+    selected = random.choices(keys, k=num_requests)
     rng = np.random.default_rng(args.seed)
-    offsets = np.cumsum(rng.exponential(1.0 / args.qps, size=args.num_requests))
+    offsets = np.cumsum(rng.exponential(1.0 / args.qps, size=num_requests))
 
     eng_kwargs = dict(
         model=args.model,
         enforce_eager=True,
         gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len,
+        load_format=args.load_format,
         scheduler_cls="mars.v1.scheduler.MARSScheduler",
         additional_config=MarsConfig(
             api_policy=args.api_policy,
             policy_config=args.policy_config,
             chunk_fill=args.chunk_fill,
             chunk_size=args.chunk_size,
+            use_solver=args.use_solver,
+            starvation_avoidance=args.starvation_avoidance,
+            starvation_threshold=args.starvation_threshold,
+            starvation_quantum=args.starvation_quantum,
         ).to_additional_config(),
     )
     if args.swap:
@@ -192,14 +200,21 @@ def main() -> None:
     ap.add_argument("--workload", required=True)
     ap.add_argument("--model", default="facebook/opt-125m")
     ap.add_argument("--num-requests", type=int, default=8)
+    ap.add_argument("--window", type=float, default=0.0,
+                    help="seconds; if >0, num_requests = qps*window (like the original)")
     ap.add_argument("--qps", type=float, default=8.0)
     ap.add_argument("--api-policy", default="V")
     ap.add_argument("--policy-config", default="fcfs")
     ap.add_argument("--chunk-fill", action="store_true")
     ap.add_argument("--chunk-size", type=int, default=0)
+    ap.add_argument("--use-solver", action="store_true", help="Gurobi solver for 'V'")
+    ap.add_argument("--starvation-avoidance", action="store_true")
+    ap.add_argument("--starvation-threshold", type=int, default=100)
+    ap.add_argument("--starvation-quantum", type=int, default=100000)
     ap.add_argument("--swap", action="store_true", help="enable SimpleCPUOffloadConnector")
     ap.add_argument("--cpu-gb", type=float, default=4.0)
     ap.add_argument("--prefix-cache", action="store_true")
+    ap.add_argument("--load-format", default="auto", help="e.g. 'dummy' for no download")
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-mem", type=float, default=0.4)
     ap.add_argument("--seed", type=int, default=0)

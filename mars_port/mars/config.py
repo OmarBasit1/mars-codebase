@@ -73,6 +73,19 @@ class MarsConfig:
     # original chunk-fill victim selection. Pure 'P' is never demoted.
     demote_under_pressure: bool = True
     demote_pressure_threshold: float = 0.9
+    # Gurobi solver (decision-only) for the 'V' policy: per pause, solve the
+    # optimal KV split and apply the dominant WHOLE-request mode. Coefficients
+    # are re-calibrated via examples/calibrate_cost.py (6B reference values from
+    # the original 6B_bench.sh in comments). See COMPARISON.md for the
+    # partial-split -> whole-request discrepancy.
+    use_solver: bool = False
+    solver_target: float = 1500.0  # SLA target throughput (tokens/s)
+    solver_per_token_swap_latency: float = 4e-5
+    solver_poly_a: float = 1.3e-5  # forward time = (a*x^2 + b*x + c)/1000 ms
+    solver_poly_b: float = 0.328
+    solver_poly_c: float = 24.1
+    solver_free_swap_tokens: int = 976
+    solver_timeout: float = 0.025  # Gurobi TimeLimit (s)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "MarsConfig":
