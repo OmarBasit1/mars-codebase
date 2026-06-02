@@ -66,6 +66,13 @@ class MarsConfig:
     cost_swap_a1: float = 0.136
     cost_swap_a2: float = 0.181
     cost_swap_c: float = 22.5
+    # Dynamic memory-pressure demotion (Greedy / InferCept, and V under
+    # pressure): when KV usage exceeds the threshold and requests are waiting,
+    # demote the cheaper preserved-paused requests (free their KV -> swap /
+    # recompute) so the freed memory can admit waiting work. Mirrors the
+    # original chunk-fill victim selection. Pure 'P' is never demoted.
+    demote_under_pressure: bool = True
+    demote_pressure_threshold: float = 0.9
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "MarsConfig":

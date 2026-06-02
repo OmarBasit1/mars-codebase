@@ -103,6 +103,10 @@ class MARSScheduler(Scheduler):
         self.mars_preserve_count = 0
         self.mars_recompute_count = 0
         self.mars_swap_count = 0
+        # Preserved-paused requests holding pinned KV -> candidates for dynamic
+        # memory-pressure demotion.
+        self.mars_paused_preserved: dict[str, Request] = {}
+        self.mars_demotions = 0
         logger.info(
             "[MARS] scheduler active: api_policy=%s policy_config=%s "
             "swap_available=%s block_size=%s chunk_fill=%s",
@@ -142,8 +146,11 @@ class MARSScheduler(Scheduler):
 
         mode, detail = self._decide_pause_mode(request, st.policy_letter)
         if mode is PauseMode.PRESERVE:
-            # Keep blocks resident; nothing to do.
+            # Keep blocks resident; track as a demotion candidate (unless pure P,
+            # which is never demoted -- the baseline that just pins memory).
             self.mars_preserve_count += 1
+            if st.policy_letter != "P":
+                self.mars_paused_preserved[request.request_id] = request
             logger.info(
                 "[MARS] pause req=%s policy=%s mode=preserve (kept KV)%s",
                 request.request_id,
@@ -179,10 +186,18 @@ class MARSScheduler(Scheduler):
             )
 
     def _decide_pause_mode(self, request: Request, policy_letter: str):
-        """Resolve the concrete pause mode (and a log detail string).
+        """Resolve the concrete pause mode and a log-detail string.
 
-        Direct policies (P/D/S) map straight through; the adaptive 'V' (Vulcan)
-        policy chooses Preserve vs Recompute via the 2-way cost model.
+        Routing by ``policy_letter``:
+          * ``V`` -> cost-model choice (2-way, or 3-way when swap is available)
+            via :meth:`_vulcan_decision`.
+          * ``H``/``H-S``/``H-D``/``H-B`` -> ``api_exec_time`` threshold
+            heuristics (swap arms degraded when swap is unavailable).
+          * ``G``/``I`` -> their *static* pause mode (PRESERVE). NOTE: partial by
+            design -- the dynamic memory-pressure demotion that distinguishes
+            Greedy / InferCept is the chunk-fill machinery and is deferred (a
+            Phase-6 follow-up); once added, G and I will need to diverge here.
+          * ``P``/``D``/``S`` -> direct mode (swap degraded when unavailable).
         """
         if policy_letter == "V":
             return self._vulcan_decision(request)
@@ -246,10 +261,93 @@ class MARSScheduler(Scheduler):
         detail = " " + " ".join(f"{label[m]}={w:.4g}" for m, w in wastes.items())
         return mode, detail
 
+    # --- dynamic memory-pressure demotion ---------------------------------
+
+    def schedule(self):
+        # Before the base scheduler admits/preempts, free the cheapest
+        # preserved-paused KV under memory pressure so waiting work can run.
+        if (
+            self.mars_config.demote_under_pressure
+            and len(self.mars_paused_preserved) > 1
+        ):
+            self._mars_demote_under_pressure()
+        return super().schedule()
+
+    def _mars_demote_under_pressure(self) -> None:
+        # Act only with pending admission demand and real KV pressure.
+        if not self.waiting:
+            return
+        usage = self.kv_cache_manager.usage
+        if usage < self.mars_config.demote_pressure_threshold:
+            return
+        # Rank candidates by demote waste; demote all but the costliest one
+        # (faithful to the original: keep the single highest-waste request
+        # preserved, demote the cheaper ones to reclaim memory).
+        cands = []
+        for rid, req in self.mars_paused_preserved.items():
+            mode, waste = self._demote_choice(rid, req)
+            cands.append((waste, rid, req, mode))
+        if len(cands) <= 1:
+            return
+        cands.sort(key=lambda x: x[0])
+        for waste, rid, req, mode in cands[:-1]:
+            self._demote(rid, req, mode, waste, usage)
+
+    def _demote_choice(self, rid: str, request: Request):
+        """Pick the demote mode + waste for a preserved-paused request.
+
+        InferCept ('I') demotes recompute-only (2-way); other policies pick the
+        cheaper of swap/recompute when swap is available (3-way).
+        """
+        bs = self._block_size
+        num_blocks = max(1, (request.num_tokens + bs - 1) // bs)
+        running_batch = sum(
+            max(1, r.num_tokens - r.num_computed_tokens) for r in self.running
+        )
+        running_blocks = sum(
+            (r.num_computed_tokens + bs - 1) // bs for r in self.running
+        )
+        w_d = self.cost_model.discard_waste(num_blocks, running_batch, running_blocks)
+        st = self.mars_state.get(rid)
+        letter = st.policy_letter if st is not None else self.mars_config.api_policy
+        if letter == "I" or not self._swap_available:
+            return PauseMode.RECOMPUTE, w_d
+        w_s = self.cost_model.swap_waste(num_blocks, running_batch, running_blocks)
+        return (PauseMode.SWAP, w_s) if w_s < w_d else (PauseMode.RECOMPUTE, w_d)
+
+    def _demote(self, rid, request, mode, waste, usage) -> None:
+        # Free the preserved-paused KV now; resume reloads (SWAP) or recomputes
+        # (RECOMPUTE) -- the same mechanism as a SWAP/RECOMPUTE pause.
+        self.kv_cache_manager.free(request)
+        st = self.mars_state.get(rid)
+        if st is None:
+            st = _MarsReqState(policy_letter=self._api_policy_for(request))
+            self.mars_state[rid] = st
+        st.pending_reset = True
+        self.mars_preserve_count -= 1
+        if mode is PauseMode.SWAP:
+            st.pending_skip_prefix = False
+            self.mars_swap_count += 1
+        else:
+            st.pending_skip_prefix = self.mars_config.recompute_skip_prefix_cache
+            self.mars_recompute_count += 1
+        self.mars_paused_preserved.pop(rid, None)
+        self.mars_demotions += 1
+        logger.info(
+            "[MARS] demote req=%s -> %s waste=%.4g (usage=%.2f, %d preserved left)",
+            rid,
+            mode.value,
+            waste,
+            usage,
+            len(self.mars_paused_preserved),
+        )
+
     # --- resume hook -------------------------------------------------------
 
     def _update_request_as_session(self, session: Request, update) -> None:
         super()._update_request_as_session(session, update)
+        # Resuming -> no longer a preserved-paused demotion candidate.
+        self.mars_paused_preserved.pop(session.request_id, None)
         st = self.mars_state.get(session.request_id)
         if st is not None and st.pending_reset:
             # Blocks were released at the pause. Recompute from num_computed=0;
@@ -266,4 +364,5 @@ class MARSScheduler(Scheduler):
 
     def _free_request(self, request: Request, *args, **kwargs):
         self.mars_state.pop(request.request_id, None)
+        self.mars_paused_preserved.pop(request.request_id, None)
         return super()._free_request(request, *args, **kwargs)
