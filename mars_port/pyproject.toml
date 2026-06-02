@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mars"
+version = "0.0.1"
+description = "MARS: Fast Inference for Augmented LLMs — vLLM v1 extension layer"
+requires-python = ">=3.10"
+# Intentionally no vllm/torch pins here: this package layers on top of the
+# already-installed editable vLLM (do not let the resolver touch it).
+# Research deps (gurobipy, peft, transformers) are added in later phases.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mars*"]
