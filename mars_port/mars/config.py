@@ -61,6 +61,11 @@ class MarsConfig:
     cost_a: float = 0.0463
     cost_c: float = 10.0
     cost_max_ragged_batch: int = 384
+    # Swap-waste coefficients (Phase 6, 3-way Vulcan). Original MARS values;
+    # re-profile against the CPU-offload transfer path for real experiments.
+    cost_swap_a1: float = 0.136
+    cost_swap_a2: float = 0.181
+    cost_swap_c: float = 22.5
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "MarsConfig":

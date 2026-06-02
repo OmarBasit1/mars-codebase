@@ -52,9 +52,13 @@ class _MarsReqState:
 
     policy_letter: str
     pauses: int = 0
-    # Set when blocks were freed at a pause (RECOMPUTE); triggers a
+    # Set when blocks were freed at a pause (SWAP or RECOMPUTE); triggers a
     # num_computed_tokens reset after the next resume-fold.
-    pending_recompute_reset: bool = False
+    pending_reset: bool = False
+    # For RECOMPUTE, also bypass the prefix cache on resume (force a true
+    # recompute). For SWAP this stays False so the prefix cache / CPU-offload
+    # connector serves the KV back from host instead of recomputing.
+    pending_skip_prefix: bool = False
 
 
 class MARSScheduler(Scheduler):
@@ -65,7 +69,12 @@ class MARSScheduler(Scheduler):
         self.mars_config = MarsConfig.from_vllm_config(self.vllm_config)
         self.mars_state: dict[str, _MarsReqState] = {}
         # Swap is only real once a CPU-offload KV connector is configured (Phase 6).
-        self._swap_available = self.connector is not None
+        # SWAP needs a CPU-offload KV connector AND prefix caching (the connector
+        # is backed by the prefix cache). Otherwise swap-ish policies degrade.
+        self._swap_available = (
+            self.connector is not None
+            and bool(getattr(self.cache_config, "enable_prefix_caching", False))
+        )
         self._block_size = getattr(self.cache_config, "block_size", None) or 16
         # Cost model for the adaptive 'V' (Vulcan) policy.
         self.cost_model = CostModel(
@@ -74,6 +83,9 @@ class MARSScheduler(Scheduler):
                 c=self.mars_config.cost_c,
                 max_ragged_batch=self.mars_config.cost_max_ragged_batch,
                 block_size=self._block_size,
+                swap_a1=self.mars_config.cost_swap_a1,
+                swap_a2=self.mars_config.cost_swap_a2,
+                swap_c=self.mars_config.cost_swap_c,
             )
         )
         # chunk-fill (simplified): cap the per-step token budget so paused
@@ -90,6 +102,7 @@ class MARSScheduler(Scheduler):
         self.mars_total_pauses = 0
         self.mars_preserve_count = 0
         self.mars_recompute_count = 0
+        self.mars_swap_count = 0
         logger.info(
             "[MARS] scheduler active: api_policy=%s policy_config=%s "
             "swap_available=%s block_size=%s chunk_fill=%s",
@@ -128,24 +141,38 @@ class MARSScheduler(Scheduler):
         self.mars_total_pauses += 1
 
         mode, detail = self._decide_pause_mode(request, st.policy_letter)
-        if mode is PauseMode.RECOMPUTE:
-            # Free the paused request's KV now (idempotent: req_to_blocks.pop).
-            # num_computed_tokens is left intact so the resume-fold can still
-            # locate the kept output tokens; it is reset afterwards.
-            self.kv_cache_manager.free(request)
-            st.pending_recompute_reset = True
-            self.mars_recompute_count += 1
+        if mode is PauseMode.PRESERVE:
+            # Keep blocks resident; nothing to do.
+            self.mars_preserve_count += 1
             logger.info(
-                "[MARS] pause req=%s policy=%s mode=recompute (freed KV)%s",
+                "[MARS] pause req=%s policy=%s mode=preserve (kept KV)%s",
                 request.request_id,
                 st.policy_letter,
                 detail,
             )
-        else:
-            # PRESERVE: keep blocks resident; nothing to do.
-            self.mars_preserve_count += 1
+            return
+        # SWAP or RECOMPUTE: free the paused request's KV now (idempotent
+        # req_to_blocks.pop) so the GPU memory is available during the API wait.
+        # num_computed_tokens is left intact so the resume-fold can still locate
+        # the kept output tokens; it is reset (and, for RECOMPUTE, the prefix
+        # cache bypassed) after the fold.
+        self.kv_cache_manager.free(request)
+        st.pending_reset = True
+        if mode is PauseMode.SWAP:
+            # Reload the KV from the prefix cache / CPU-offload host on resume.
+            st.pending_skip_prefix = False
+            self.mars_swap_count += 1
             logger.info(
-                "[MARS] pause req=%s policy=%s mode=preserve (kept KV)%s",
+                "[MARS] pause req=%s policy=%s mode=swap (freed KV -> host)%s",
+                request.request_id,
+                st.policy_letter,
+                detail,
+            )
+        else:  # RECOMPUTE
+            st.pending_skip_prefix = self.mars_config.recompute_skip_prefix_cache
+            self.mars_recompute_count += 1
+            logger.info(
+                "[MARS] pause req=%s policy=%s mode=recompute (freed KV)%s",
                 request.request_id,
                 st.policy_letter,
                 detail,
@@ -203,29 +230,37 @@ class MARSScheduler(Scheduler):
         running_blocks = sum(
             (r.num_computed_tokens + bs - 1) // bs for r in self.running
         )
-        mode, w_p, w_d = self.cost_model.choose_2way(
+        mode, wastes = self.cost_model.choose(
             api_exec_time=api_exec_time,
             before_api_tokens=before_api_tokens,
             num_blocks=num_blocks,
             running_batch=running_batch,
             running_blocks=running_blocks,
+            swap_available=self._swap_available,
         )
-        return mode, f" w_p={w_p:.4g} w_d={w_d:.4g}"
+        label = {
+            PauseMode.PRESERVE: "w_p",
+            PauseMode.RECOMPUTE: "w_d",
+            PauseMode.SWAP: "w_s",
+        }
+        detail = " " + " ".join(f"{label[m]}={w:.4g}" for m, w in wastes.items())
+        return mode, detail
 
     # --- resume hook -------------------------------------------------------
 
     def _update_request_as_session(self, session: Request, update) -> None:
         super()._update_request_as_session(session, update)
         st = self.mars_state.get(session.request_id)
-        if st is not None and st.pending_recompute_reset:
-            # Blocks were released at the pause -> recompute the whole folded
-            # prompt (prompt + kept output + injected API tokens).
+        if st is not None and st.pending_reset:
+            # Blocks were released at the pause. Recompute from num_computed=0;
+            # SWAP lets the prefix cache / CPU-offload host serve the prefix back,
+            # while RECOMPUTE additionally bypasses the cache to force a true
+            # recompute (prompt + kept output + injected API tokens).
             session.num_computed_tokens = 0
-            if self.mars_config.recompute_skip_prefix_cache:
-                # Force a true recompute rather than silently re-reading the KV
-                # that may still be sitting in the prefix-cache pool.
+            if st.pending_skip_prefix:
                 session.skip_reading_prefix_cache = True
-            st.pending_recompute_reset = False
+            st.pending_reset = False
+            st.pending_skip_prefix = False
 
     # --- cleanup -----------------------------------------------------------
 

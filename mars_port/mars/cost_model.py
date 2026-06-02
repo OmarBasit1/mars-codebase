@@ -41,6 +41,10 @@ class CostModelCoeffs:
     c: float = 10.0
     max_ragged_batch: int = 384
     block_size: int = 16
+    # Swap-waste coefficients (Phase 6, 3-way).
+    swap_a1: float = 0.136
+    swap_a2: float = 0.181
+    swap_c: float = 22.5
 
 
 class CostModel:
@@ -82,6 +86,23 @@ class CostModel:
         w_d += f_last * (running_blocks * bs + last_resume_toks)
         return w_d
 
+    def swap_waste(
+        self, num_blocks: int, running_batch: int, running_blocks: int
+    ) -> float:
+        """w_s: memory-time wasted waiting for the host<->GPU KV transfer.
+
+        Ported from the original ``swap_waste``; linear in the number of swap
+        iterations ``n``. Coefficients are transfer-path specific (re-profile
+        against the CPU-offload connector for real experiments).
+        """
+        co = self.coeffs
+        bs = co.block_size
+        c_h = max(co.max_ragged_batch - running_batch, 1)
+        n = max((bs * num_blocks + c_h - 1) // c_h - 1, 1)
+        f_ch = (co.swap_a1 * c_h) / 1000.0
+        f_s = (co.swap_a2 * co.max_ragged_batch + co.swap_c) / 1000.0
+        return f_s * n * bs * num_blocks + f_ch * n * running_blocks * bs * 2
+
     def choose_2way(
         self,
         *,
@@ -96,3 +117,33 @@ class CostModel:
         w_d = self.discard_waste(num_blocks, running_batch, running_blocks)
         mode = PauseMode.PRESERVE if w_p <= w_d else PauseMode.RECOMPUTE
         return mode, w_p, w_d
+
+    def choose(
+        self,
+        *,
+        api_exec_time: float,
+        before_api_tokens: int,
+        num_blocks: int,
+        running_batch: int,
+        running_blocks: int,
+        swap_available: bool,
+    ) -> tuple[PauseMode, dict[PauseMode, float]]:
+        """Greedy 3-way (or 2-way) Vulcan: pick the minimum-waste mode.
+
+        Returns ``(mode, wastes)`` where ``wastes`` maps each evaluated mode to
+        its waste (SWAP is included only when ``swap_available``). The full
+        partial-split optimisation (the original Gurobi solver) is a refinement
+        on top of this greedy choice.
+        """
+        wastes: dict[PauseMode, float] = {
+            PauseMode.PRESERVE: self.preserve_waste(api_exec_time, before_api_tokens),
+            PauseMode.RECOMPUTE: self.discard_waste(
+                num_blocks, running_batch, running_blocks
+            ),
+        }
+        if swap_available:
+            wastes[PauseMode.SWAP] = self.swap_waste(
+                num_blocks, running_batch, running_blocks
+            )
+        mode = min(wastes, key=lambda m: wastes[m])
+        return mode, wastes
