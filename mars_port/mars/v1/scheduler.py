@@ -35,10 +35,8 @@ from mars.config import MarsConfig
 from mars.cost_model import CostModel, CostModelCoeffs
 from mars.params import MarsApiParams
 from mars.policies import (
-    THRESHOLD_POLICIES,
     PauseMode,
     decide_pause_mode,
-    decide_threshold_mode,
     degrade_swap,
 )
 from mars.v1.queue import _MarsHeapQueue, make_mars_queue
@@ -104,6 +102,16 @@ class _MARSSchedulerMixin:
             and bool(getattr(self.cache_config, "enable_prefix_caching", False))
         )
         self._block_size = getattr(self.cache_config, "block_size", None) or 16
+        # cost_max_ragged_batch: if not set, read the per-step token budget from
+        # vllm's scheduler_config (the point where compute saturates). Falls back
+        # to 384 if the attribute is unavailable (old configs).
+        if self.mars_config.cost_max_ragged_batch is None:
+            max_batched = getattr(
+                getattr(self.vllm_config, "scheduler_config", None),
+                "max_num_batched_tokens",
+                None,
+            )
+            self.mars_config.cost_max_ragged_batch = int(max_batched) if max_batched else 384
         # Cost model for the adaptive 'V' (Vulcan) policy.
         self.cost_model = CostModel(
             CostModelCoeffs(
@@ -148,16 +156,32 @@ class _MARSSchedulerMixin:
         # sort to the front via key -inf).
         self.mars_starving: set[str] = set()
         self.mars_wait_counter: dict[str, int] = {}
-        # Waiting-queue ordering: SJF / V2 replace the native FCFS queue (it is
-        # empty at construction time, so swapping is safe).
-        mars_queue = make_mars_queue(self.mars_config.policy_config, self.mars_starving)
+        # Waiting-queue ordering: SJF / V2 replace both native FCFS queues (both
+        # are empty at construction time, so swapping is safe).  ``skipped_waiting``
+        # holds parked-for-API requests and resumed requests (they flip status in
+        # place and stay in skipped_waiting).  Replacing it with the same MARS queue
+        # (shared starving set, same key function) enables combined V2/SJF ordering
+        # across both queues — faithful to the original's combined_targets sort.
+        mars_queue = make_mars_queue(
+            self.mars_config.policy_config,
+            self.mars_starving,
+            self.mars_config.cost_max_ragged_batch,
+        )
         if mars_queue is not None:
             self.waiting = mars_queue
+            self.skipped_waiting = make_mars_queue(
+                self.mars_config.policy_config,
+                self.mars_starving,
+                self.mars_config.cost_max_ragged_batch,
+            )
+        # Gate combined-queue overrides on MARS queues actually being active.
+        self._mars_queues: bool = isinstance(self.waiting, _MarsHeapQueue)
         # Observability counters (read by tests / logged).
         self.mars_total_pauses = 0
         self.mars_preserve_count = 0
         self.mars_recompute_count = 0
         self.mars_swap_count = 0
+        self.mars_swap_reloads = 0  # SWAP resumes -> async host->GPU reload engaged
         # Preserved-paused requests holding pinned KV -> candidates for dynamic
         # memory-pressure demotion.
         self.mars_paused_preserved: dict[str, Request] = {}
@@ -335,35 +359,17 @@ class _MARSSchedulerMixin:
         """Resolve the concrete pause mode and a log-detail string.
 
         Routing by ``policy_letter``:
-          * ``V``/``G``/``I`` -> always PRESERVE at the pause (faithful to the
-            original: a Vulcan request pauses preserved; the swap/recompute it
-            was classified for at arrival is applied later by the every-step
-            demotion in :meth:`schedule` -- ``_mars_demote_paused`` /
-            ``_demote_choice``, where ``I`` demotes recompute-only and ``V``/``G``
-            use the arrival-classified strategy).
-          * ``H``/``H-S``/``H-D``/``H-B`` -> ``api_exec_time`` threshold
-            heuristics (swap arms degraded when swap is unavailable).
+          * ``V`` -> always PRESERVE at the pause (faithful to the original: the
+            swap/recompute classified at arrival is applied later by the every-step
+            demotion in :meth:`schedule` -- ``_mars_demote_paused``/
+            ``_demote_choice`` using the arrival-classified strategy).
           * ``P``/``D``/``S`` -> direct mode (swap degraded when unavailable).
         """
-        if policy_letter in ("V", "G", "I"):
+        if policy_letter == "V":
             # Static PRESERVE at the pause; demotion applies the arrival strategy.
             st = self.mars_state.get(request.request_id)
             strat = st.arrival_strategy if st is not None else ""
             return PauseMode.PRESERVE, f" (preserve; arrival_strategy={strat or '?'})"
-        if policy_letter in THRESHOLD_POLICIES:
-            mp = MarsApiParams.from_sampling_params(request.sampling_params)
-            api_exec_time = mp.api_exec_time if mp is not None else 1.0
-            mode = decide_threshold_mode(
-                policy_letter,
-                api_exec_time=api_exec_time,
-                heuristic_coef=self.mars_config.heuristic_coef,
-            )
-            mode = degrade_swap(
-                mode,
-                swap_available=self._swap_available,
-                swap_fallback=self.mars_config.swap_fallback,
-            )
-            return mode, f" api_t={api_exec_time:g}"
         # Direct P / D / S.
         mode = decide_pause_mode(
             policy_letter,
@@ -394,19 +400,51 @@ class _MARSSchedulerMixin:
             self._mars_demote_paused()
         return super().schedule()
 
+    def _select_waiting_queue_for_scheduling(self):
+        """Combined V2/SJF ordering across ``waiting`` and ``skipped_waiting``.
+
+        When both are MARS heaps, pick whichever non-empty queue has the smaller
+        head key (true combined order — faithful to the original's
+        ``combined_targets = self.swapped + self.waiting`` sorted together). The
+        base's pop→try-promote→requeue loop handles unpromotable heads (still
+        waiting for API) gracefully: they move to ``step_skipped_waiting`` for
+        the remainder of the pass, so there is no infinite loop.
+        For FCFS (no MARS queues) we fall through to the base implementation.
+        """
+        if not self._mars_queues:
+            return super()._select_waiting_queue_for_scheduling()
+        w_has = bool(self.waiting)
+        s_has = bool(self.skipped_waiting)
+        if not w_has and not s_has:
+            return None
+        if w_has and not s_has:
+            return self.waiting
+        if s_has and not w_has:
+            return self.skipped_waiting
+        # Both non-empty: the head with the smaller key goes first.
+        return (
+            self.waiting
+            if self.waiting.peek_key() <= self.skipped_waiting.peek_key()
+            else self.skipped_waiting
+        )
+
     def _mars_rekey_v2(self) -> None:
-        """Re-rank the V2 waiting heap with the live ``running_batch`` (O(n)).
+        """Re-rank both V2 heaps with the live ``running_batch`` (O(n) each).
 
         Faithful to the original ``sort_by_priority(running_batch=live)`` run
         every step: the V2 score's compute terms scale with contention, so the
         ordering adapts to load (the insertion-time ``running_batch=0`` key is a
-        cheap placeholder that this overwrites). ``n`` is bounded by
+        cheap placeholder that this overwrites). Both ``waiting`` and
+        ``skipped_waiting`` are re-keyed so resumed swap requests in
+        ``skipped_waiting`` compete under the same live score — replicating the
+        original's combined swapped+waiting sort. ``n`` is bounded by
         ``max_num_seqs`` (≤512), so the heapify cost is negligible.
         """
-        if not isinstance(self.waiting, _MarsHeapQueue) or not self.waiting:
-            return
         running_batch, running_blocks = self._running_contention()
-        self.waiting.rekey(lambda r: self._v2_score(r, running_batch, running_blocks))
+        key_fn = lambda r: self._v2_score(r, running_batch, running_blocks)
+        for q in (self.waiting, self.skipped_waiting):
+            if isinstance(q, _MarsHeapQueue) and q:
+                q.rekey(key_fn)
 
     def _mem_time(self, num_blocks: int, running_batch: int) -> float:
         """V2 memory-time of computing ``num_blocks`` (ports calculate_memory_time_blocks).
@@ -455,27 +493,36 @@ class _MARSSchedulerMixin:
     def _mars_starvation_pass(self) -> None:
         """Boost requests that have waited too long to the front of the queue.
 
-        Each step, increment a wait counter for every request still in
-        ``self.waiting``; once it exceeds ``starvation_threshold`` the request is
-        marked *starving* (key ``-inf`` in the MARS queues) and moved to the
-        front, where it stays until scheduled (the original's ``quantum`` is
-        treated as "boosted until scheduled"). FCFS uses ``prepend_request``.
+        Each step, increment a wait counter for every *schedulable* request in
+        either ``self.waiting`` or ``self.skipped_waiting`` (status==WAITING only;
+        parked WAITING_FOR_STREAMING_REQ / WAITING_FOR_REMOTE_KVS are skipped —
+        boosting something that cannot run yet is pointless). Once the counter
+        exceeds ``starvation_threshold`` the request is marked *starving* (key
+        ``-inf`` in both MARS heaps) so it sorts to the front of the combined
+        order (the original's ``quantum`` is "boosted until scheduled").
         """
         threshold = self.mars_config.starvation_threshold
         waiting_ids: set[str] = set()
         boosted = 0
-        for req in list(self.waiting):
-            rid = req.request_id
-            waiting_ids.add(rid)
-            if rid in self.mars_starving:
-                continue
-            count = self.mars_wait_counter.get(rid, 0) + 1
-            self.mars_wait_counter[rid] = count
-            if count > threshold:
-                self.mars_starving.add(rid)
-                self._mars_boost(req)
-                boosted += 1
-        # Drop bookkeeping for requests that left the waiting queue (scheduled).
+        # Scan both queues; only count requests that are currently schedulable.
+        queues = [self.waiting]
+        if self._mars_queues:
+            queues.append(self.skipped_waiting)
+        for queue in queues:
+            for req in list(queue):
+                if req.status != RequestStatus.WAITING:
+                    continue  # parked / in-KV-transfer: skip
+                rid = req.request_id
+                waiting_ids.add(rid)
+                if rid in self.mars_starving:
+                    continue
+                count = self.mars_wait_counter.get(rid, 0) + 1
+                self.mars_wait_counter[rid] = count
+                if count > threshold:
+                    self.mars_starving.add(rid)
+                    self._mars_boost(req, queue)
+                    boosted += 1
+        # Drop bookkeeping for requests that left waiting (scheduled/finished).
         for rid in list(self.mars_wait_counter):
             if rid not in waiting_ids:
                 self.mars_wait_counter.pop(rid, None)
@@ -483,14 +530,14 @@ class _MARSSchedulerMixin:
         if boosted:
             logger.info("[MARS] starvation: boosted %d request(s) to front", boosted)
 
-    def _mars_boost(self, request: Request) -> None:
-        try:
-            self.waiting.remove_request(request)
-        except (ValueError, KeyError):
-            return
-        # FCFS deque -> appendleft (front); MARS heap -> re-add with key -inf
-        # (the request is already in mars_starving at this point).
-        self.waiting.prepend_request(request)
+    def _mars_boost(self, request: Request, queue=None) -> None:
+        # Remove from the source queue (which was already determined by the
+        # starvation pass or the caller) and re-add; the -inf starvation key is
+        # applied by _key() because the request is already in mars_starving.
+        if queue is None:
+            queue = self.waiting
+        queue.remove_request(request)
+        queue.prepend_request(request)
 
     def _mars_demote_paused(self) -> None:
         # Faithful to the original _schedule_chunk_and_fill: every step keep only
@@ -500,7 +547,9 @@ class _MARSSchedulerMixin:
         # workload instead of bursting it in one step. Gated only on pending
         # admission demand -- there is no point freeing KV nothing is waiting for
         # (v1 reloads at resume, so a needless demote is a wasted host round-trip).
-        if not self.waiting:
+        # Gate on work actually waiting (either queue); resumed swap requests
+        # in skipped_waiting also need memory, so they count as demand.
+        if not self.waiting and not (self._mars_queues and self.skipped_waiting):
             return
         usage = self.kv_cache_manager.usage
         # Optional usage floor (0 => no gate, the faithful default).
@@ -529,17 +578,13 @@ class _MARSSchedulerMixin:
     def _demote_choice(self, rid: str, request: Request):
         """``(mode, waste)`` to demote a preserved-paused request, from classify().
 
-        InferCept ('I') demotes recompute-only; other policies apply the
-        arrival-classified strategy (swap/recompute). A 'preserve'-classified
-        request returns ``mode=None`` (it is never demoted), matching the
-        original (a PRESERVE-strategy candidate falls through both branches).
+        Applies the arrival-classified strategy (swap/recompute). A
+        'preserve'-classified request returns ``mode=None`` (it is never demoted),
+        matching the original (a PRESERVE-strategy candidate stays pinned).
         """
         st = self.mars_state.get(rid)
-        letter = st.policy_letter if st is not None else self.mars_config.api_policy
         waste = st.arrival_waste if st is not None else 0.0
         strat = st.arrival_strategy if st is not None else "recompute"
-        if letter == "I":
-            return PauseMode.RECOMPUTE, waste
         if strat == "swap" and self._swap_available:
             return PauseMode.SWAP, waste
         if strat == "recompute":
@@ -585,9 +630,18 @@ class _MARSSchedulerMixin:
             # SWAP lets the prefix cache / CPU-offload host serve the prefix back,
             # while RECOMPUTE additionally bypasses the cache to force a true
             # recompute (prompt + kept output + injected API tokens).
+            is_swap = not st.pending_skip_prefix  # SWAP=False/RECOMPUTE=True
             session.num_computed_tokens = 0
             if st.pending_skip_prefix:
                 session.skip_reading_prefix_cache = True
+            if is_swap:
+                # The connector will serve KV from host asynchronously
+                # (WAITING_FOR_REMOTE_KVS overlap) when the request is next admitted.
+                self.mars_swap_reloads += 1
+                logger.info(
+                    "[MARS] swap reload req=%s (async host->GPU via connector)",
+                    session.request_id,
+                )
             st.pending_reset = False
             st.pending_skip_prefix = False
 

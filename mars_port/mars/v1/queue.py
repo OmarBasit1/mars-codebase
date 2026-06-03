@@ -9,10 +9,10 @@ FCFS uses vLLM's native queue. Both MARS queues consult a shared ``starving`` se
 (owned by ``MARSScheduler``) so starvation-boosted requests sort to the front
 (key ``-inf``) — this supports the paper's ``V + V2 + starvation`` config.
 
-Note: heap keys are fixed at insertion, so the ``V2`` score is computed with
-``running_batch=0`` and the ``preserve`` strategy (v1's heap can't re-rank with a
-live running batch each step). This preserves the relative ordering; see
-COMPARISON.md.
+Note: the V2 insertion key uses ``running_batch=0`` as a cheap placeholder; the
+scheduler calls ``rekey`` every step with the live ``running_batch`` (read from
+``vllm_config.scheduler_config.max_num_batched_tokens``) so the ordering is always
+up-to-date. See COMPARISON.md.
 """
 
 from __future__ import annotations
@@ -37,29 +37,36 @@ def _sjf_key(request: Request) -> float:
     return float("inf")
 
 
-def _mem_time(num_blocks: int, running_batch: int) -> float:
-    """Memory-time of computing ``num_blocks`` (ported from policy.py V2)."""
-    c_h = max(384 - running_batch, 1)
+def _mem_time(num_blocks: int, running_batch: int, max_ragged_batch: int) -> float:
+    """Memory-time of computing ``num_blocks`` (ported from policy.py V2).
+
+    ``max_ragged_batch`` is the per-step token budget where compute saturates
+    (read from ``vllm_config.scheduler_config.max_num_batched_tokens``).
+    """
+    c_h = max(max_ragged_batch - running_batch, 1)
     n = max((_BS * num_blocks + c_h - 1) // c_h, 1)
-    f_s = (0.1 * 384 + 10) / 1000
+    f_s = (0.1 * max_ragged_batch + 10) / 1000
     return f_s * (1 + n) * n / 2 * c_h
 
 
-def _v2_key(request: Request) -> float:
-    """Cost-based ``V2`` score (lower = scheduled first); ports policy.py:V2.
+def _make_v2_key(max_ragged_batch: int) -> Callable[[Request], float]:
+    """Return a V2 insertion-key function for the given ``max_ragged_batch``.
 
-    Uses the ``preserve``-strategy score with ``running_batch=0``.
+    Uses the ``preserve``-strategy score with ``running_batch=0`` as a cheap
+    placeholder; the scheduler overwrites this with a live rekey each step.
     """
-    mp = MarsApiParams.from_sampling_params(request.sampling_params)
-    if mp is None:
-        return float("inf")
-    prompt_len = getattr(request, "num_prompt_tokens", 0) or 0
-    before_blocks = (prompt_len + mp.predicted_api_invoke_interval + _BS - 1) // _BS
-    after_blocks = (mp.predicted_api_invoke_interval + mp.api_return_length + _BS - 1) // _BS
-    before = _mem_time(before_blocks, 0)
-    after = _mem_time(after_blocks, 0)
-    api_memory = before_blocks * _BS * mp.predicted_api_exec_time
-    return before + api_memory + after
+    def _v2_key(request: Request) -> float:
+        mp = MarsApiParams.from_sampling_params(request.sampling_params)
+        if mp is None:
+            return float("inf")
+        prompt_len = getattr(request, "num_prompt_tokens", 0) or 0
+        before_blocks = (prompt_len + mp.predicted_api_invoke_interval + _BS - 1) // _BS
+        after_blocks = (mp.predicted_api_invoke_interval + mp.api_return_length + _BS - 1) // _BS
+        before = _mem_time(before_blocks, 0, max_ragged_batch)
+        after = _mem_time(after_blocks, 0, max_ragged_batch)
+        api_memory = before_blocks * _BS * mp.predicted_api_exec_time
+        return before + api_memory + after
+    return _v2_key
 
 
 class _MarsHeapQueue(RequestQueue):
@@ -92,6 +99,16 @@ class _MarsHeapQueue(RequestQueue):
         self._key_fn = key_fn
         self._heap = [(self._key(req), counter, req) for _, counter, req in self._heap]
         heapq.heapify(self._heap)
+
+    def peek_key(self) -> float:
+        """Return the smallest key in the heap without popping (O(1)).
+
+        Used by ``_select_waiting_queue_for_scheduling`` to compare head keys
+        of ``self.waiting`` and ``self.skipped_waiting`` for combined ordering.
+        """
+        if not self._heap:
+            return float("inf")
+        return self._heap[0][0]
 
     def pop_request(self) -> Request:
         if not self._heap:
@@ -138,18 +155,25 @@ class MARSRequestQueue(_MarsHeapQueue):
 
 
 class V2RequestQueue(_MarsHeapQueue):
-    """Cost-based ``V2`` queue (memory-time waste score; lower first)."""
+    """Cost-based ``V2`` queue (memory-time waste score; lower first).
 
-    def __init__(self, starving: set[str] | None = None) -> None:
-        super().__init__(_v2_key, starving)
+    ``max_ragged_batch`` is read from ``vllm_config.scheduler_config.max_num_batched_tokens``
+    and passed in by the scheduler; it sets the per-step token saturation point for
+    the insertion-time placeholder score (overwritten by rekey each step anyway).
+    """
+
+    def __init__(self, starving: set[str] | None = None, max_ragged_batch: int = 384) -> None:
+        super().__init__(_make_v2_key(max_ragged_batch), starving)
 
 
 def make_mars_queue(
-    policy_config: str, starving: set[str] | None = None
+    policy_config: str,
+    starving: set[str] | None = None,
+    max_ragged_batch: int = 384,
 ) -> RequestQueue | None:
     """Return a MARS queue for ``policy_config``, or ``None`` to keep native FCFS."""
     if policy_config == "sjf":
         return MARSRequestQueue(starving)
     if policy_config == "V2":
-        return V2RequestQueue(starving)
+        return V2RequestQueue(starving, max_ragged_batch)
     return None
