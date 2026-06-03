@@ -81,6 +81,18 @@ class _MarsHeapQueue(RequestQueue):
     def add_request(self, request: Request) -> None:
         heapq.heappush(self._heap, (self._key(request), next(self._counter), request))
 
+    def rekey(self, key_fn: Callable[[Request], float]) -> None:
+        """Recompute every entry's key with ``key_fn`` and re-heapify (O(n)).
+
+        Each insertion ``counter`` is preserved (stable ties) and the starving
+        ``-inf`` override is re-applied via :meth:`_key`. The scheduler calls this
+        once per step to re-rank V2 with the live ``running_batch`` — faithful to
+        the original ``sort_by_priority(running_batch=live)`` each step.
+        """
+        self._key_fn = key_fn
+        self._heap = [(self._key(req), counter, req) for _, counter, req in self._heap]
+        heapq.heapify(self._heap)
+
     def pop_request(self) -> Request:
         if not self._heap:
             raise IndexError("pop from empty queue")

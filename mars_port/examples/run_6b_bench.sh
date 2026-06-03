@@ -37,7 +37,7 @@ run() {  # tag qps policy-flags...
   CUDA_VISIBLE_DEVICES="$GPU" VLLM_LOGGING_LEVEL=ERROR "$PY" -m mars.bench.run \
     --workload "$WL" --model "$MODEL" --window "$WINDOW" --qps "$qps" \
     --max-model-len "$MAX_MODEL_LEN" --gpu-mem "$GPU_MEM" --cpu-gb "$CPU_GB" \
-    $LOAD $EXTRA "$@" --csv "$OUT/${tag}_${qps}.csv" 2>/dev/null
+    $LOAD $EXTRA "$@" --csv "${tag}_${qps}.csv" 2>/dev/null  # cwd is already $OUT
   echo
 }
 

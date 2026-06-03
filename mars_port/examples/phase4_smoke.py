@@ -1,13 +1,17 @@
-"""Phase 4 end-to-end: adaptive Vulcan ('V') picks Preserve vs Recompute.
+"""Phase 4 end-to-end: adaptive Vulcan ('V') classifies its strategy at arrival.
 
-Runs two requests under api_policy='V': one with a SHORT predicted API time
-(holding KV is cheap -> PRESERVE) and one with a LONG predicted API time
-(holding wastes memory-time -> RECOMPUTE). The bash wrapper greps the '[MARS]'
-logs to confirm V_short chose preserve and V_long chose recompute.
+Faithful to the original, classify() runs at ARRIVAL on the predicted length and
+records the KV strategy; the V request then always PAUSES as PRESERVE, and the
+classified swap/recompute is applied only later by the every-step demotion (which
+needs memory pressure + waiting work). This test runs two V requests with no
+contention, so neither is demoted -- both just preserve and finish. The strategy
+choice is surfaced by the arrival ``[MARS] classify ... -> strategy=...`` log:
+one with a SHORT predicted API time (holding KV is cheap -> preserve) and one
+with a LONG predicted API time (holding wastes memory-time -> recompute). The
+bash wrapper greps those classify lines.
 
 (``api_exec_time`` -- the orchestrator's simulated sleep -- is kept small for
-speed; ``predicted_api_exec_time`` -- what the scheduler's cost model reads --
-is what drives the decision.)
+speed; ``predicted_api_exec_time`` -- what classify reads -- drives the decision.)
 """
 
 import asyncio
@@ -55,8 +59,8 @@ async def main() -> None:
             scheduler_cls="mars.v1.scheduler.MARSScheduler",
         )
     )
-    r_short = await run(engine, "V_short", predicted_exec=0.001)  # -> preserve
-    r_long = await run(engine, "V_long", predicted_exec=1.0)  # -> recompute
+    r_short = await run(engine, "V_short", predicted_exec=0.001)  # classify -> preserve
+    r_long = await run(engine, "V_long", predicted_exec=1.0)  # classify -> recompute
     print("V_short finished/pauses/gen:", r_short.finished, r_short.pauses, r_short.total_generated)
     print("V_long  finished/pauses/gen:", r_long.finished, r_long.pauses, r_long.total_generated)
     assert r_short.finished and r_long.finished, "request did not finish"

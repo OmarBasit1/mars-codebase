@@ -41,12 +41,20 @@ from mars.policies import (
     decide_threshold_mode,
     degrade_swap,
 )
-from mars.v1.queue import make_mars_queue
+from mars.v1.queue import _MarsHeapQueue, make_mars_queue
 from mars.v1.solver import GUROBI_AVAILABLE, MarsSolver, SolverParams, split_to_mode
 
 # Name under the "vllm" namespace so MARS logs inherit vLLM's log handler
 # (vLLM configures a handler on the "vllm" logger only, propagate=False).
 logger = init_logger("vllm.mars.scheduler")
+
+# Cost-model PauseMode <-> the original's strategy strings (stored at arrival by
+# classify() and consumed by demotion + the V2 ordering branch).
+_MODE_TO_STRATEGY = {
+    PauseMode.PRESERVE: "preserve",
+    PauseMode.RECOMPUTE: "recompute",
+    PauseMode.SWAP: "swap",
+}
 
 
 @dataclass
@@ -62,6 +70,13 @@ class _MarsReqState:
     # recompute). For SWAP this stays False so the prefix cache / CPU-offload
     # connector serves the KV back from host instead of recomputing.
     pending_skip_prefix: bool = False
+    # Arrival-time classify() result (predicted length): the KV strategy the
+    # request will be demoted to, and its waste. Faithful to the original
+    # classify(): consumed by the every-step demotion (which mode + the
+    # max-waste victim ranking) and the V2 ordering branch. The V pause itself
+    # always PRESERVEs; the strategy is applied only at demotion.
+    arrival_strategy: str = ""  # "preserve" / "recompute" / "swap"
+    arrival_waste: float = 0.0
 
 
 class _MARSSchedulerMixin:
@@ -166,6 +181,97 @@ class _MARSSchedulerMixin:
             return mp.api_policy
         return self.mars_config.api_policy
 
+    def _running_contention(self) -> tuple[int, int]:
+        """Live (running_batch, running_blocks) — the recompute/swap contention.
+
+        ``running_batch`` ~ tokens the running requests compute this step (the
+        original ``inflight_length`` sum); ``running_blocks`` ~ their GPU blocks.
+        """
+        bs = self._block_size
+        running_batch = sum(
+            max(1, r.num_tokens - r.num_computed_tokens) for r in self.running
+        )
+        running_blocks = sum(
+            (r.num_computed_tokens + bs - 1) // bs for r in self.running
+        )
+        return running_batch, running_blocks
+
+    # --- arrival hook: classify() once, on predicted length ----------------
+
+    def _enqueue_waiting_request(self, request: Request) -> None:
+        # Faithful to the original ``add_seq_group -> classify``: pick the KV
+        # strategy once, at arrival, from the *predicted* length. Gated on
+        # ``mars_state`` so resumes / preemption re-enqueues never re-classify.
+        if request.request_id not in self.mars_state:
+            self._mars_classify(request)
+        super()._enqueue_waiting_request(request)
+
+    def _mars_classify(self, request: Request) -> None:
+        """Choose strategy + waste at arrival using the *predicted* length.
+
+        Ports the original ``classify()``: predict blocks from
+        ``prompt_len + predicted_api_invoke_interval``, score preserve/recompute/
+        swap (with the live running-batch contention), store the argmin. The
+        result drives demotion (which mode, and the max-waste ranking) and the
+        V2 ordering branch — NOT the pause itself (V always preserves).
+        """
+        letter = self._api_policy_for(request)
+        st = _MarsReqState(policy_letter=letter)
+        self.mars_state[request.request_id] = st
+        mp = MarsApiParams.from_sampling_params(request.sampling_params)
+        if mp is None:
+            st.arrival_strategy = "preserve"
+            return
+        bs = self._block_size
+        prompt_len = getattr(request, "num_prompt_tokens", 0) or 0
+        seq_blocks = max(1, (prompt_len + mp.predicted_api_invoke_interval + bs - 1) // bs)
+        before_api_tokens = seq_blocks * bs
+        running_batch, running_blocks = self._running_contention()
+        mode, wastes = self.cost_model.choose(
+            api_exec_time=mp.predicted_api_exec_time,
+            before_api_tokens=before_api_tokens,
+            num_blocks=seq_blocks,
+            running_batch=running_batch,
+            running_blocks=running_blocks,
+            swap_available=self._swap_available,
+        )
+        # Optional decision-only solver (V only) overrides the greedy mode; the
+        # waste for ranking is still taken from the greedy cost model.
+        if self.solver is not None and letter == "V":
+            smode = self._solver_mode(request, mp, seq_blocks, running_batch, running_blocks)
+            if smode is not None and smode in wastes:
+                mode = smode
+        st.arrival_strategy = _MODE_TO_STRATEGY[mode]
+        st.arrival_waste = wastes[mode]
+        logger.info(
+            "[MARS] classify req=%s policy=%s -> strategy=%s waste=%.4g (predicted)",
+            request.request_id, letter, st.arrival_strategy, st.arrival_waste,
+        )
+
+    def _solver_mode(self, request, mp, num_blocks, running_batch, running_blocks):
+        """Decision-only Gurobi solve -> dominant whole-request mode (or None)."""
+        res = self.solver.solve_blocks(
+            num_tokens=request.num_tokens,
+            num_active_gpu_blocks=running_blocks,
+            api_exec_time=mp.predicted_api_exec_time,
+            api_return_length=mp.api_return_length,
+            arrival_time=request.arrival_time,
+            now=time.time(),
+            running_query_head=running_batch,
+            running_query_tail=running_batch,
+            swap_in_chunks_head=self.solver.free_swap,
+            swap_in_chunks_tail=self.solver.free_swap,
+        )
+        if res is None:
+            return None
+        c_s, c_d, n_e = res
+        mode, _ = split_to_mode(
+            c_s, c_d, n_e, num_blocks,
+            swap_available=self._swap_available,
+            swap_fallback=self.mars_config.swap_fallback,
+        )
+        return mode
+
     # --- pause hook --------------------------------------------------------
 
     def _handle_stopped_request(self, request: Request) -> bool:
@@ -229,18 +335,21 @@ class _MARSSchedulerMixin:
         """Resolve the concrete pause mode and a log-detail string.
 
         Routing by ``policy_letter``:
-          * ``V`` -> cost-model choice (2-way, or 3-way when swap is available)
-            via :meth:`_vulcan_decision`.
+          * ``V``/``G``/``I`` -> always PRESERVE at the pause (faithful to the
+            original: a Vulcan request pauses preserved; the swap/recompute it
+            was classified for at arrival is applied later by the every-step
+            demotion in :meth:`schedule` -- ``_mars_demote_paused`` /
+            ``_demote_choice``, where ``I`` demotes recompute-only and ``V``/``G``
+            use the arrival-classified strategy).
           * ``H``/``H-S``/``H-D``/``H-B`` -> ``api_exec_time`` threshold
             heuristics (swap arms degraded when swap is unavailable).
-          * ``G``/``I`` -> their *static* pause mode (PRESERVE) here; the dynamic
-            memory-pressure demotion that distinguishes Greedy / InferCept runs
-            in :meth:`schedule` (``_mars_demote_paused``), where ``I``
-            demotes recompute-only and ``G`` is swap-aware.
           * ``P``/``D``/``S`` -> direct mode (swap degraded when unavailable).
         """
-        if policy_letter == "V":
-            return self._vulcan_decision(request)
+        if policy_letter in ("V", "G", "I"):
+            # Static PRESERVE at the pause; demotion applies the arrival strategy.
+            st = self.mars_state.get(request.request_id)
+            strat = st.arrival_strategy if st is not None else ""
+            return PauseMode.PRESERVE, f" (preserve; arrival_strategy={strat or '?'})"
         if policy_letter in THRESHOLD_POLICIES:
             mp = MarsApiParams.from_sampling_params(request.sampling_params)
             api_exec_time = mp.api_exec_time if mp is not None else 1.0
@@ -255,10 +364,6 @@ class _MARSSchedulerMixin:
                 swap_fallback=self.mars_config.swap_fallback,
             )
             return mode, f" api_t={api_exec_time:g}"
-        if policy_letter in ("G", "I"):
-            # Static pause mode is PRESERVE; the dynamic demotion that makes
-            # Greedy / InferCept distinct runs in schedule() under memory pressure.
-            return PauseMode.PRESERVE, " (static; demote under pressure)"
         # Direct P / D / S.
         mode = decide_pause_mode(
             policy_letter,
@@ -267,71 +372,19 @@ class _MARSSchedulerMixin:
         )
         return mode, ""
 
-    def _vulcan_decision(self, request: Request):
-        """2-way Vulcan: pick Preserve vs Recompute by the cost model.
-
-        Uses the request's *actual* current length (known at the pause) and the
-        current running-batch state as the recompute-contention context.
-        """
-        bs = self._block_size
-        mp = MarsApiParams.from_sampling_params(request.sampling_params)
-        api_exec_time = mp.predicted_api_exec_time if mp is not None else 1.0
-        num_blocks = max(1, (request.num_tokens + bs - 1) // bs)
-        before_api_tokens = num_blocks * bs
-        # Competition for GPU during a recompute = the other running requests.
-        running_batch = sum(
-            max(1, r.num_tokens - r.num_computed_tokens) for r in self.running
-        )
-        running_blocks = sum(
-            (r.num_computed_tokens + bs - 1) // bs for r in self.running
-        )
-        # Solver path (decision-only): solve the optimal KV split and apply the
-        # dominant whole-request mode; fall back to the greedy choice on failure.
-        if self.solver is not None:
-            res = self.solver.solve_blocks(
-                num_tokens=request.num_tokens,
-                num_active_gpu_blocks=running_blocks,
-                api_exec_time=api_exec_time,
-                api_return_length=(mp.api_return_length if mp is not None else 0),
-                arrival_time=request.arrival_time,
-                now=time.time(),
-                running_query_head=running_batch,
-                running_query_tail=running_batch,
-                swap_in_chunks_head=self.solver.free_swap,
-                swap_in_chunks_tail=self.solver.free_swap,
-            )
-            if res is not None:
-                c_s, c_d, n_e = res
-                mode, _ = split_to_mode(
-                    c_s, c_d, n_e, num_blocks,
-                    swap_available=self._swap_available,
-                    swap_fallback=self.mars_config.swap_fallback,
-                )
-                return mode, f" solver(c_s={c_s},c_d={c_d},n_e={n_e})"
-        mode, wastes = self.cost_model.choose(
-            api_exec_time=api_exec_time,
-            before_api_tokens=before_api_tokens,
-            num_blocks=num_blocks,
-            running_batch=running_batch,
-            running_blocks=running_blocks,
-            swap_available=self._swap_available,
-        )
-        label = {
-            PauseMode.PRESERVE: "w_p",
-            PauseMode.RECOMPUTE: "w_d",
-            PauseMode.SWAP: "w_s",
-        }
-        detail = " " + " ".join(f"{label[m]}={w:.4g}" for m, w in wastes.items())
-        return mode, detail
-
-    # --- dynamic memory-pressure demotion ---------------------------------
+    # --- V2 ordering + dynamic demotion -----------------------------------
 
     def schedule(self):
         # Pre-pass before the base scheduler admits/preempts:
         #  1. starvation — boost long-waiting requests to the front;
-        #  2. demotion — free the cheapest preserved-paused KV under pressure.
+        #  2. V2 re-key — re-rank the waiting queue with the live running_batch;
+        #  3. demotion — apply the arrival-classified strategy to preserved KV.
         if self.mars_config.starvation_avoidance:
             self._mars_starvation_pass()
+        # Re-rank V2 with the live running_batch each step (after starvation so
+        # the -inf boosts survive), faithful to the original per-step re-sort.
+        if self.mars_config.policy_config == "V2":
+            self._mars_rekey_v2()
         # chunk_fill (the original's switch for the demotion machinery) or the
         # explicit demote_under_pressure knob enables dynamic demotion.
         if (
@@ -340,6 +393,64 @@ class _MARSSchedulerMixin:
         ):
             self._mars_demote_paused()
         return super().schedule()
+
+    def _mars_rekey_v2(self) -> None:
+        """Re-rank the V2 waiting heap with the live ``running_batch`` (O(n)).
+
+        Faithful to the original ``sort_by_priority(running_batch=live)`` run
+        every step: the V2 score's compute terms scale with contention, so the
+        ordering adapts to load (the insertion-time ``running_batch=0`` key is a
+        cheap placeholder that this overwrites). ``n`` is bounded by
+        ``max_num_seqs`` (≤512), so the heapify cost is negligible.
+        """
+        if not isinstance(self.waiting, _MarsHeapQueue) or not self.waiting:
+            return
+        running_batch, running_blocks = self._running_contention()
+        self.waiting.rekey(lambda r: self._v2_score(r, running_batch, running_blocks))
+
+    def _mem_time(self, num_blocks: int, running_batch: int) -> float:
+        """V2 memory-time of computing ``num_blocks`` (ports calculate_memory_time_blocks).
+
+        Uses V2's own coefficients (a=0.1, c=10), distinct from the cost model's.
+        """
+        co = self.cost_model.coeffs
+        c_h = max(co.max_ragged_batch - running_batch, 1)
+        n = max((co.block_size * num_blocks + c_h - 1) // c_h, 1)
+        f_s = (0.1 * co.max_ragged_batch + 10.0) / 1000.0
+        return f_s * (1 + n) * n / 2 * c_h
+
+    def _v2_score(self, request: Request, running_batch: int, running_blocks: int) -> float:
+        """V2 ordering score (lower = scheduled first), live ``running_batch``.
+
+        Ports ``policy.py:V2.get_priority``'s three strategy branches, keyed off
+        the request's arrival-classified strategy. The original returns ``-score``
+        sorted ``reverse=True`` (== smallest score first); the MARS min-heap pops
+        the smallest key first, so we return ``score`` directly.
+        """
+        mp = MarsApiParams.from_sampling_params(request.sampling_params)
+        if mp is None:
+            return float("inf")
+        bs = self._block_size
+        prompt_len = getattr(request, "num_prompt_tokens", 0) or 0
+        before_blocks = (prompt_len + mp.predicted_api_invoke_interval + bs - 1) // bs
+        after_blocks = (mp.predicted_api_invoke_interval + mp.api_return_length + bs - 1) // bs
+        before = self._mem_time(before_blocks, running_batch)
+        after = self._mem_time(after_blocks, running_batch)
+        api_exec_time = mp.predicted_api_exec_time
+        api_complete = mp.api_max_calls == 0
+        st = self.mars_state.get(request.request_id)
+        strat = st.arrival_strategy if st is not None and st.arrival_strategy else "preserve"
+        if strat == "recompute":
+            before_after = self._mem_time(before_blocks + after_blocks, running_batch)
+            return before_after if api_complete else before + 0.0 + before_after
+        if strat == "swap":
+            cpu_to_gpu_transfer_rate = 2  # original hyperparameter
+            swap = before_blocks * (before_blocks / cpu_to_gpu_transfer_rate) / 2
+            api = api_exec_time * 0.1  # integral_swap_weight
+            return (swap + after) if api_complete else before + swap + api + swap + after
+        # preserve
+        api_memory = before_blocks * bs * api_exec_time
+        return before + api_memory + after
 
     def _mars_starvation_pass(self) -> None:
         """Boost requests that have waited too long to the front of the queue.
@@ -396,40 +507,44 @@ class _MARSSchedulerMixin:
         threshold = self.mars_config.demote_pressure_threshold
         if threshold > 0 and usage < threshold:
             return
-        # Rank candidates by demote waste; demote all but the costliest one
-        # (faithful to the original: keep the single highest-waste request
-        # preserved, demote the cheaper ones to reclaim memory).
-        cands = []
-        for rid, req in self.mars_paused_preserved.items():
-            mode, waste = self._demote_choice(rid, req)
-            cands.append((waste, rid, req, mode))
-        if len(cands) <= 1:
+        # Faithful to the original _schedule_chunk_and_fill: keep the single
+        # highest-(arrival-)waste request pinned (and any 'preserve'-classified
+        # ones), demote the rest to their arrival-classified strategy. Modes and
+        # wastes come from classify() (predicted), NOT a live recompute.
+        # 'preserve'-classified candidates (mode None) are never demoted; among
+        # the demotable ones keep exactly the costliest (sorting breaks ties so
+        # identical-waste requests don't all stay pinned -> no deadlock).
+        demotable = [
+            (waste, rid, req, mode)
+            for rid, req in self.mars_paused_preserved.items()
+            for mode, waste in [self._demote_choice(rid, req)]
+            if mode is not None
+        ]
+        if len(demotable) <= 1:
             return
-        cands.sort(key=lambda x: x[0])
-        for waste, rid, req, mode in cands[:-1]:
+        demotable.sort(key=lambda x: x[0])
+        for waste, rid, req, mode in demotable[:-1]:  # all but the costliest
             self._demote(rid, req, mode, waste, usage)
 
     def _demote_choice(self, rid: str, request: Request):
-        """Pick the demote mode + waste for a preserved-paused request.
+        """``(mode, waste)`` to demote a preserved-paused request, from classify().
 
-        InferCept ('I') demotes recompute-only (2-way); other policies pick the
-        cheaper of swap/recompute when swap is available (3-way).
+        InferCept ('I') demotes recompute-only; other policies apply the
+        arrival-classified strategy (swap/recompute). A 'preserve'-classified
+        request returns ``mode=None`` (it is never demoted), matching the
+        original (a PRESERVE-strategy candidate falls through both branches).
         """
-        bs = self._block_size
-        num_blocks = max(1, (request.num_tokens + bs - 1) // bs)
-        running_batch = sum(
-            max(1, r.num_tokens - r.num_computed_tokens) for r in self.running
-        )
-        running_blocks = sum(
-            (r.num_computed_tokens + bs - 1) // bs for r in self.running
-        )
-        w_d = self.cost_model.discard_waste(num_blocks, running_batch, running_blocks)
         st = self.mars_state.get(rid)
         letter = st.policy_letter if st is not None else self.mars_config.api_policy
-        if letter == "I" or not self._swap_available:
-            return PauseMode.RECOMPUTE, w_d
-        w_s = self.cost_model.swap_waste(num_blocks, running_batch, running_blocks)
-        return (PauseMode.SWAP, w_s) if w_s < w_d else (PauseMode.RECOMPUTE, w_d)
+        waste = st.arrival_waste if st is not None else 0.0
+        strat = st.arrival_strategy if st is not None else "recompute"
+        if letter == "I":
+            return PauseMode.RECOMPUTE, waste
+        if strat == "swap" and self._swap_available:
+            return PauseMode.SWAP, waste
+        if strat == "recompute":
+            return PauseMode.RECOMPUTE, waste
+        return None, waste  # 'preserve' (or 'swap' w/o connector): stay pinned
 
     def _demote(self, rid, request, mode, waste, usage) -> None:
         # Free the preserved-paused KV now; resume reloads (SWAP) or recomputes
