@@ -29,10 +29,10 @@ subsystem, what the original did, what the port does, and any **discrepancy**.
 - **Port**: `mars.cost_model` ports the same formulas verbatim; greedy `choose` (2-way without swap, 3-way with). Coefficients re-calibrated via `examples/calibrate_cost.py`.
 - **Discrepancy**: `classify` ran at **arrival** (predicted length); the port decides at the **pause** using the *actual* length (more accurate).
 
-### Solver (the biggest discrepancy)
-- **Original**: a Gurobi MIP (`core/solver.py`) splits ONE request's KV into preserved `s_p` + swapped `c_s`/iter + recomputed `c_d`/iter over `n_e` iterations, executed **incrementally across steps** (`resume_swap_blocks`/`resume_discard_tokens`/`running_inflight_tokens`).
-- **Port**: same MIP (`mars/v1/solver.py`), but **decision-only** — it runs the MIP and applies the **dominant whole-request mode** (largest block share → PRESERVE/SWAP/RECOMPUTE). v1 has no per-request *partial*-KV-region execution; adding it would need large core surgery (model runner + attention metadata + scheduler), breaking the zero-core-edit design.
-- **DISCREPANCY (largest)**: no partial split. A request that the original would *partially* swap and *partially* recompute is, in the port, swapped **or** recomputed as a whole. Gated by `use_solver`; falls back to the greedy cost model if Gurobi is unavailable/times out.
+### Solver (NOT used in the original evaluation)
+- **Original**: `core/solver.py` defines a Gurobi MIP that splits ONE request's KV into preserved `s_p` + swapped `c_s`/iter + recomputed `c_d`/iter over `n_e` iterations — **but it is never called by the schedulers.** `Solver` is only an *unused import* in `scheduler*.py`; the sole `Solver()` instantiation is solver.py's own `__main__` self-test (line 134). The evaluated MARS (`exps/6B_bench.sh`, `--api-policy V`) therefore decided KV strategy with the **greedy `classify()`** (min of `w_p`/`w_d`/`w_s` at arrival) + the V2 queue + chunk-fill demotion — NOT the MIP (a per-pause Gurobi solve is too slow for serving).
+- **Port**: the greedy `cost_model.choose` (default, `use_solver=False`) **faithfully reproduces what the original evaluation actually ran**. We *additionally* wired the MIP **decision-only** (`use_solver=True`) — run the MIP per pause, apply the dominant whole-request mode — as an enhancement the original never executed. (v1 has no per-request partial-KV execution, so the MIP's partial split is collapsed to a whole-request choice; falls back to greedy if Gurobi is unavailable/times out.)
+- **Discrepancy**: none for the *default* config (greedy `V` matches the paper). For parity use `use_solver=False`; the `use_solver=True` path is *beyond* the original (and is whole-request, not partial-split).
 
 ### Dynamic memory-pressure demotion (Greedy / InferCept)
 - **Original**: in `_schedule_chunk_and_fill`, each step demote the cheaper preserved-paused requests by waste, keeping the highest-waste one; InferCept is recompute-only, V/G swap-aware.
@@ -73,10 +73,10 @@ subsystem, what the original did, what the port does, and any **discrepancy**.
 - **Port**: async `mars.bench.run` (AsyncLLM + `ApiOrchestrator`, Poisson arrivals, `--window`); `examples/run_6b_bench.sh` reproduces the matrix; `mars.bench.policy_cost` gives a predicted per-policy waste table.
 
 ## Discrepancy summary (ranked by impact)
-1. **Solver is decision-only (whole-request), not partial-split** — the single largest algorithmic difference. May change absolute numbers on requests where the optimal is a genuine mix of swap+recompute; the *direction* of the decision is preserved.
+1. **chunk-fill is approximated** by `token_budget` + demotion (no per-step ragged-batch token shaping / partial swap-in) — the largest fidelity gap in the *evaluated* path, since the original `V` relied on chunk-fill's fine-grained scheduling.
 2. **Swap is whole-request via the CPU-offload connector** (no partial block swap).
-3. **chunk-fill is approximated** by token_budget + demotion (no per-step ragged-batch shaping).
-4. **V2 queue uses a static (insertion-time) key** (running_batch=0), not re-ranked each step.
+3. **The MILP solver was UNUSED in the original evaluation** (the greedy `classify()` was used). The port's default greedy `V` (`use_solver=False`) reproduces that; `use_solver=True` is an *optional* decision-only enhancement (whole-request, not partial-split) — **not** a fidelity gap for the default config.
+4. **V2 queue uses a static (insertion-time) key** (`running_batch=0`), not re-ranked each step.
 5. **Starvation quantum simplified** to "boost until scheduled".
 
-Everything else (pause/resume, the three KV policies, the cost model formulas, the greedy 3-way / solver decision, demotion victim selection, SJF/FCFS ordering, calibration) is a **faithful** port. PRESERVE/SWAP/RECOMPUTE are verified to yield identical output, so the policies remain a pure performance/memory choice as in the paper.
+Everything else (pause/resume, the three KV policies, the greedy cost-model formulas the eval actually used, demotion victim selection, SJF/FCFS/V2 ordering, calibration) is a **faithful** port. PRESERVE/SWAP/RECOMPUTE are verified to yield identical output, so the policies remain a pure performance/memory choice as in the paper.
