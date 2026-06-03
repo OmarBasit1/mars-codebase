@@ -34,8 +34,7 @@ class MarsApiParams:
         api_exec_time: Actual API/tool latency in seconds.
         predicted_api_exec_time: Predicted latency used by the cost model.
         api_max_calls: Max #API calls for this request (0 = unlimited).
-        api_policy: Per-request KV policy override
-            (``P``/``S``/``D``/``V``/``G``/``H``/``H-S``/``H-D``/``H-B``/``I``);
+        api_policy: Per-request KV policy override (``P``/``D``/``S``/``V``);
             ``None`` falls back to the engine-wide MARS config.
         strategy: Chosen KV strategy this pause (``preserve``/``swap``/``recompute``).
         remain_length: Remaining output tokens after the final API call.

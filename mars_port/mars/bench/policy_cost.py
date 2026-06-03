@@ -19,26 +19,17 @@ import numpy as np
 from mars.config import MarsConfig
 from mars.cost_model import CostModel, CostModelCoeffs
 from mars.policies import (
-    THRESHOLD_POLICIES,
     PauseMode,
     decide_pause_mode,
-    decide_threshold_mode,
 )
 
-POLICIES = ["P", "D", "S", "V", "G", "I", "H", "H-S", "H-D", "H-B"]
+POLICIES = ["P", "D", "S", "V"]
 
 
-def waste_for(policy, *, wastes, api_exec_time, heuristic_coef):
+def waste_for(policy, *, wastes):
     """Predicted waste for ``policy`` at one pause given the three mode costs."""
     if policy == "V":
         return min(wastes.values())
-    if policy in ("G", "I"):
-        return wastes[PauseMode.PRESERVE]  # static; demotes under pressure
-    if policy in THRESHOLD_POLICIES:
-        mode = decide_threshold_mode(
-            policy, api_exec_time=api_exec_time, heuristic_coef=heuristic_coef
-        )
-        return wastes[mode]
     mode = decide_pause_mode(policy, swap_available=True)  # P / D / S
     return wastes[mode]
 
@@ -50,7 +41,6 @@ def main() -> None:
     ap.add_argument("--block-size", type=int, default=16)
     ap.add_argument("--running-batch", type=int, default=128)
     ap.add_argument("--running-blocks", type=int, default=256)
-    ap.add_argument("--heuristic-coef", type=float, default=d.heuristic_coef)
     ap.add_argument("--cost-a", type=float, default=d.cost_a)
     ap.add_argument("--cost-c", type=float, default=d.cost_c)
     ap.add_argument("--cost-swap-a1", type=float, default=d.cost_swap_a1)
@@ -83,9 +73,7 @@ def main() -> None:
             }
             n_pauses += 1
             for p in POLICIES:
-                totals[p] += waste_for(
-                    p, wastes=wastes, api_exec_time=api_exec, heuristic_coef=args.heuristic_coef
-                )
+                totals[p] += waste_for(p, wastes=wastes)
 
     print(f"workload: {len(workload)} requests, {n_pauses} API pauses")
     print(f"context: running_batch={args.running_batch} running_blocks={args.running_blocks}")

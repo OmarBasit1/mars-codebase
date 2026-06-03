@@ -108,6 +108,7 @@ async def main_async(args: argparse.Namespace) -> None:
         gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len,
         load_format=args.load_format,
+        disable_hybrid_kv_cache_manager=True,
         scheduler_cls="mars.v1.scheduler.MARSScheduler",
         additional_config=MarsConfig(
             api_policy=args.api_policy,

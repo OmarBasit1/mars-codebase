@@ -76,14 +76,14 @@ def measure_swap(bytes_per_tok: int, token_counts: list[int], reps: int = 10) ->
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.6-27B-FP8")
-    ap.add_argument("--max-model-len", type=int, default=40960)
+    ap.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct")
+    ap.add_argument("--max-model-len", type=int, default=32768)
     ap.add_argument("--load-format", default="auto")
     args = ap.parse_args()
 
     # --- SWAP (host<->GPU KV transfer) — run before LLM load to avoid memory pressure ---
     bpt = kv_bytes_per_token_from_config(args.model)
-    counts = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 40960]
+    counts = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     sw = measure_swap(bpt, counts)
     print(f"\n# swap (KV {bpt} bytes/token; D2H+H2D round-trip)")
     for n, s in zip(counts, sw):
@@ -102,7 +102,7 @@ def main() -> None:
         load_format=args.load_format,
     )
 
-    lengths = [n for n in (8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 40960) if n <= args.max_model_len - 1]
+    lengths = [n for n in (8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768) if n <= args.max_model_len - 1]
     lat = [measure_prefill(llm, n) for n in lengths]
     print("\n# forward / recompute (prefill latency)")
     for n, l in zip(lengths, lat):

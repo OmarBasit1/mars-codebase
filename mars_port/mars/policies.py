@@ -30,9 +30,9 @@ _DIRECT: dict[str, PauseMode] = {
     "S": PauseMode.SWAP,
 }
 
-# Adaptive / heuristic policies whose per-pause choice is made by the cost model
-# (Phase 4) or heuristics (Phase 5). Listed here for validation/reference.
-ADAPTIVE_POLICIES = frozenset({"V", "G", "H", "H-S", "H-D", "H-B", "I"})
+# Adaptive policy whose per-pause choice is made by the cost model (classify()
+# at arrival). Listed here for validation/reference.
+ADAPTIVE_POLICIES = frozenset({"V"})
 
 
 def decide_pause_mode(
@@ -43,9 +43,9 @@ def decide_pause_mode(
 ) -> PauseMode:
     """Resolve a MARS ``api_policy`` letter to a concrete :class:`PauseMode`.
 
-    Phase 3 resolves the direct policies ``P``/``D`` (and ``S`` degraded). The
-    adaptive policies default to PRESERVE here so the engine runs end-to-end;
-    Phase 4+ overrides this decision with the cost model / solver.
+    Resolves the direct policies ``P``/``D`` (and ``S`` degraded). The adaptive
+    ``V`` policy defaults to PRESERVE here; the demotion pass applies the
+    arrival-classified strategy each step.
 
     Args:
         api_policy: The MARS policy letter (per-request or engine default).
@@ -58,7 +58,7 @@ def decide_pause_mode(
     """
     mode = _DIRECT.get(api_policy)
     if mode is None:
-        # Adaptive policy: resolved later; safe default keeps generation correct.
+        # Adaptive policy (V): always preserve at the pause.
         return PauseMode.PRESERVE
     return degrade_swap(mode, swap_available=swap_available, swap_fallback=swap_fallback)
 
@@ -72,31 +72,3 @@ def degrade_swap(
             PauseMode.RECOMPUTE if swap_fallback == "recompute" else PauseMode.PRESERVE
         )
     return mode
-
-
-# Threshold heuristic baselines (decide per-pause on api_exec_time).
-THRESHOLD_POLICIES = frozenset({"H", "H-S", "H-D", "H-B"})
-
-
-def decide_threshold_mode(
-    policy_letter: str, *, api_exec_time: float, heuristic_coef: float
-) -> PauseMode:
-    """The MARS threshold heuristics (ported verbatim from scheduler_v2.py).
-
-    May return SWAP; the caller applies :func:`degrade_swap` when CPU offload is
-    unavailable. ``H`` uses the configurable ``heuristic_coef``; ``H-S``/``H-D``/
-    ``H-B`` use the original fixed thresholds (4 s and 7 s).
-    """
-    if policy_letter == "H":
-        return PauseMode.SWAP if api_exec_time >= heuristic_coef else PauseMode.PRESERVE
-    if policy_letter == "H-S":
-        return PauseMode.SWAP if api_exec_time >= 4 else PauseMode.PRESERVE
-    if policy_letter == "H-D":
-        return PauseMode.RECOMPUTE if api_exec_time >= 7 else PauseMode.PRESERVE
-    if policy_letter == "H-B":
-        if api_exec_time < 4:
-            return PauseMode.PRESERVE
-        if api_exec_time < 7:
-            return PauseMode.SWAP
-        return PauseMode.RECOMPUTE
-    raise ValueError(f"not a threshold heuristic policy: {policy_letter}")

@@ -32,14 +32,14 @@ _GENERIC_COST_DEFAULTS: dict[str, float] = {
 # Per-GPU calibrated overrides.  Matched as substrings of torch device name.
 _GPU_PROFILES: dict[str, dict[str, float]] = {
     "A40": {
-        "cost_a": 0.809818,
-        "cost_c": -26.540,
-        "cost_swap_a1": 120.6319,
-        "solver_per_token_swap_latency": 1.206e-04,
-        "solver_poly_a": 2.694e-06,
-        "solver_poly_b": 0.7299,
-        "solver_poly_c": 65.731,
-    },
+            "cost_a": 0.002395,
+            "cost_c": 55.122,
+            "cost_swap_a1": 84.9189,
+            "solver_per_token_swap_latency": 8.492e-05,  # s/tok
+            "solver_poly_a": 1.224e-8,
+            "solver_poly_b": 0.0022,
+            "solver_poly_c": 55.236,
+        },
 }
 
 
@@ -66,16 +66,15 @@ class MarsConfig:
 
     Attributes:
         api_policy: Default KV policy letter — ``P`` preserve, ``D`` discard/
-            recompute, ``S`` swap, and the adaptive ``V``/``G``/``H``/``H-S``/
-            ``H-D``/``H-B``/``I`` (adaptive policies are resolved in Phase 4+).
+            recompute, ``S`` swap, or the adaptive ``V`` (Vulcan: classify at
+            arrival, always preserve at pause, demote by arrival strategy each step).
         policy_config: Waiting-queue ordering: ``fcfs`` / ``sjf`` / ``V2``
-            (SJF wiring lands with Phase 4).
+            (cost-based memory-time, re-ranked every step with live running_batch).
         swap_fallback: How swap-ish policies degrade while CPU offload is not
-            configured (pre-Phase 6): ``recompute`` or ``preserve``.
-        chunk_fill: Enable chunk-fill admission (token_budget shaping; Phase 4).
+            configured: ``recompute`` or ``preserve``.
+        chunk_fill: Enable chunk-fill admission (token_budget shaping).
         chunk_size: Per-step token budget for chunk-fill (0 => engine default).
-        heuristic_coef: Threshold for the ``H`` heuristic (Phase 5).
-        starvation_avoidance/threshold/quantum: Anti-starvation (Phase 5).
+        starvation_avoidance/threshold/quantum: Anti-starvation.
         recompute_skip_prefix_cache: For the Recompute policy, force a true
             recompute on resume by bypassing the prefix cache (so the freed KV
             is not silently served back). Set False to allow opportunistic
@@ -87,7 +86,6 @@ class MarsConfig:
     swap_fallback: str = "recompute"
     chunk_fill: bool = False
     chunk_size: int = 0
-    heuristic_coef: float = 4.0
     starvation_avoidance: bool = False
     starvation_threshold: int = 0
     starvation_quantum: int = 0
@@ -96,10 +94,12 @@ class MarsConfig:
     # the original MARS values; re-tune per model/GPU via examples/calibrate_cost.py
     # (the forward-step time model is ~ (cost_a * batch_tokens + cost_c) ms, and
     # cost_max_ragged_batch is the tokens/step where compute saturates).
-    # None => auto-filled by __post_init__ from the detected GPU profile.
+    # None => auto-filled by __post_init__ from the detected GPU profile (cost_a/c/
+    # swap_a1/etc.) or from vllm's scheduler_config.max_num_batched_tokens
+    # (cost_max_ragged_batch) at scheduler init time.
     cost_a: float | None = None
     cost_c: float | None = None
-    cost_max_ragged_batch: int = 384
+    cost_max_ragged_batch: int | None = None
     # Swap-waste coefficients (Phase 6, 3-way Vulcan). Original MARS values;
     # re-profile against the CPU-offload transfer path for real experiments.
     cost_swap_a1: float | None = None
