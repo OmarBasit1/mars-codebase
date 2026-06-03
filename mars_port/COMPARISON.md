@@ -35,9 +35,9 @@ subsystem, what the original did, what the port does, and any **discrepancy**.
 - **Discrepancy**: none for the *default* config (greedy `V` matches the paper). For parity use `use_solver=False`; the `use_solver=True` path is *beyond* the original (and is whole-request, not partial-split).
 
 ### Dynamic memory-pressure demotion (Greedy / InferCept)
-- **Original**: in `_schedule_chunk_and_fill`, each step demote the cheaper preserved-paused requests by waste, keeping the highest-waste one; InferCept is recompute-only, V/G swap-aware.
-- **Port**: a `schedule()` pre-pass (`_mars_demote_under_pressure`) does the same — under KV pressure (`usage ≥ demote_pressure_threshold`) with requests waiting, demote all but the costliest preserved-paused request; `I` recompute-only, others swap-aware. Pure `P` is never demoted.
-- **Discrepancy**: the original demoted ~every step (the "fill" then admitted work); the port triggers **only under pressure** (v1's base scheduler owns admission/preemption). Same effect — free pinned KV so waiting work runs.
+- **Original**: in `_schedule_chunk_and_fill`, **every step (no pressure gate)** demote the cheaper preserved-paused requests by waste, keeping only the single highest-waste one pinned; InferCept is recompute-only, V/G swap-aware.
+- **Port**: a `schedule()` pre-pass (`_mars_demote_paused`) does the same — **every step**, demote all but the costliest preserved-paused request; `I` recompute-only, others swap-aware. Pure `P` is never demoted. Gated only on pending admission demand (requests waiting); an optional `demote_pressure_threshold > 0` re-enables a usage floor (default 0 = faithful, no floor). Demoting each request right after it pauses spreads the CPU-offload (PCIe) traffic across the workload instead of bursting it at a memory wall.
+- **Faithful**: matches the original's per-step "keep only max-waste preserved" cadence. **Caveat**: v1 has no mid-pause swap-back-in — a demoted-SWAP request stays freed until it *resumes* (reloads from the CPU-offload host then), whereas the original could swap it back in earlier; gating on `waiting` avoids needless free+reload round-trips.
 
 ### Waiting-queue ordering (`policy_config`)
 - **Original**: `PolicyFactory` — `fcfs` / `sjf` / `V2` (cost-based waste ranking, re-sorted each step with live `running_batch`).

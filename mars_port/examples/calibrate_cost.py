@@ -23,10 +23,11 @@ import time
 
 import numpy as np
 import torch
+from transformers import AutoConfig
 from vllm import LLM, SamplingParams, TokensPrompt
 
 
-def measure_prefill(llm: LLM, n_tokens: int, reps: int = 5) -> float:
+def measure_prefill(llm: LLM, n_tokens: int, reps: int = 10) -> float:
     sp = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
     prompt = TokensPrompt(prompt_token_ids=list(range(10, 10 + n_tokens)))
     llm.generate(prompt, sp, use_tqdm=False)  # warmup
@@ -38,18 +39,21 @@ def measure_prefill(llm: LLM, n_tokens: int, reps: int = 5) -> float:
     return float(np.median(samples))
 
 
-def kv_bytes_per_token(llm: LLM) -> int:
-    """KV-cache bytes per token (2 * layers * kv_heads * head_size * dtype)."""
-    cfg = llm.llm_engine.vllm_config
-    mc, pc = cfg.model_config, cfg.parallel_config
-    n_layers = mc.get_num_layers(pc)
-    n_kv_heads = mc.get_num_kv_heads(pc)
-    head_size = mc.get_head_size()
-    dtype_bytes = getattr(mc.dtype, "itemsize", 2)
-    return 2 * n_layers * n_kv_heads * head_size * dtype_bytes
+def kv_bytes_per_token_from_config(model: str, tp: int = 1) -> int:
+    """KV-cache bytes per token from HF config — no GPU/LLM required."""
+    top = AutoConfig.from_pretrained(model, trust_remote_code=True).to_dict()
+    # VLMs nest the LM config under "text_config"; fall back to top-level for pure LMs.
+    d = top.get("text_config", top) if "num_hidden_layers" not in top else top
+    n_layers = next((d[k] for k in ("num_hidden_layers", "n_layers", "num_layers") if k in d), None)
+    n_heads  = next((d[k] for k in ("num_attention_heads", "n_head", "num_heads") if k in d), None)
+    hidden   = next((d[k] for k in ("hidden_size", "n_embd", "d_model") if k in d), None)
+    if None in (n_layers, n_heads, hidden):
+        raise ValueError(f"Cannot derive KV shape; missing keys. Available: {sorted(d)}")
+    n_kv_heads = next((d[k] for k in ("num_key_value_heads",) if k in d), n_heads) // tp
+    return 2 * n_layers * n_kv_heads * (hidden // n_heads) * 2  # fp16 = 2 bytes
 
 
-def measure_swap(bytes_per_tok: int, token_counts: list[int], reps: int = 7) -> list[float]:
+def measure_swap(bytes_per_tok: int, token_counts: list[int], reps: int = 10) -> list[float]:
     """Median host<->GPU round-trip (D2H + H2D) latency (ms) per token count."""
     out = []
     for ntok in token_counts:
@@ -57,43 +61,29 @@ def measure_swap(bytes_per_tok: int, token_counts: list[int], reps: int = 7) -> 
         x = torch.empty(n_elems, dtype=torch.float16, device="cuda")
         torch.cuda.synchronize()
         samples = []
-        for _ in range(reps):
+        gpu_buf = None
+        for i in range(reps):
             t0 = time.perf_counter()
-            y = x.to("cpu")
-            _ = y.to("cuda")
+            cpu_buf = x.to("cpu")
+            gpu_buf = cpu_buf.to("cuda")
             torch.cuda.synchronize()
             samples.append((time.perf_counter() - t0) * 1000.0)
         out.append(float(np.median(samples)))
+        del x, cpu_buf, gpu_buf
+    torch.cuda.empty_cache()
     return out
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="facebook/opt-125m")
-    ap.add_argument("--max-model-len", type=int, default=2048)
+    ap.add_argument("--model", default="Qwen/Qwen3.6-27B-FP8")
+    ap.add_argument("--max-model-len", type=int, default=40960)
     ap.add_argument("--load-format", default="auto")
     args = ap.parse_args()
 
-    llm = LLM(
-        model=args.model, enforce_eager=True, gpu_memory_utilization=0.40,
-        max_model_len=args.max_model_len, max_num_batched_tokens=args.max_model_len,
-        load_format=args.load_format,
-    )
-
-    # --- RECOMPUTE / forward ---
-    lengths = [n for n in (16, 64, 128, 256, 512, 1024, 2048) if n <= args.max_model_len - 1]
-    lat = [measure_prefill(llm, n) for n in lengths]
-    print("\n# forward / recompute (prefill latency)")
-    for n, l in zip(lengths, lat):
-        print(f"  N={n:>5}  {l:8.3f} ms  ({l / n:.4f} ms/tok)")
-    a1, c1 = np.linalg.lstsq(np.vstack([lengths, np.ones(len(lengths))]).T, lat, rcond=None)[0]
-    qa, qb, qc = np.polyfit(lengths, lat, 2)
-    print(f"  linear:    cost_a={a1:.6f}  cost_c={c1:.3f}")
-    print(f"  quadratic: solver_poly_a={qa:.3e}  solver_poly_b={qb:.4f}  solver_poly_c={qc:.3f}")
-
-    # --- SWAP (host<->GPU KV transfer) ---
-    bpt = kv_bytes_per_token(llm)
-    counts = [256, 512, 1024, 2048, 4096]
+    # --- SWAP (host<->GPU KV transfer) — run before LLM load to avoid memory pressure ---
+    bpt = kv_bytes_per_token_from_config(args.model)
+    counts = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 40960]
     sw = measure_swap(bpt, counts)
     print(f"\n# swap (KV {bpt} bytes/token; D2H+H2D round-trip)")
     for n, s in zip(counts, sw):
@@ -104,6 +94,23 @@ def main() -> None:
 
     # --- PRESERVE ---
     print("\n# preserve: ~0 (no operation)")
+
+    # --- RECOMPUTE / forward — load LLM after swap test ---
+    llm = LLM(
+        model=args.model, enforce_eager=True, gpu_memory_utilization=0.95,
+        max_model_len=args.max_model_len, max_num_batched_tokens=args.max_model_len,
+        load_format=args.load_format,
+    )
+
+    lengths = [n for n in (8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 40960) if n <= args.max_model_len - 1]
+    lat = [measure_prefill(llm, n) for n in lengths]
+    print("\n# forward / recompute (prefill latency)")
+    for n, l in zip(lengths, lat):
+        print(f"  N={n:>5}  {l:8.3f} ms  ({l / n:.4f} ms/tok)")
+    a1, c1 = np.linalg.lstsq(np.vstack([lengths, np.ones(len(lengths))]).T, lat, rcond=None)[0]
+    qa, qb, qc = np.polyfit(lengths, lat, 2)
+    print(f"  linear:    cost_a={a1:.6f}  cost_c={c1:.3f}")
+    print(f"  quadratic: solver_poly_a={qa:.3e}  solver_poly_b={qb:.4f}  solver_poly_c={qc:.3f}")
 
     print("\n# === paste into MarsConfig (or additional_config) ===")
     print(f"MarsConfig(")

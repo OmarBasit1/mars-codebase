@@ -18,6 +18,44 @@ from typing import Any
 
 ADDITIONAL_CONFIG_KEY = "mars"
 
+# Generic fallback cost coefficients (original MARS 6B reference values).
+_GENERIC_COST_DEFAULTS: dict[str, float] = {
+    "cost_a": 0.0463,
+    "cost_c": 10.0,
+    "cost_swap_a1": 0.136,
+    "solver_per_token_swap_latency": 4e-5,
+    "solver_poly_a": 1.3e-5,
+    "solver_poly_b": 0.328,
+    "solver_poly_c": 24.1,
+}
+
+# Per-GPU calibrated overrides.  Matched as substrings of torch device name.
+_GPU_PROFILES: dict[str, dict[str, float]] = {
+    "A40": {
+        "cost_a": 0.809818,
+        "cost_c": -26.540,
+        "cost_swap_a1": 120.6319,
+        "solver_per_token_swap_latency": 1.206e-04,
+        "solver_poly_a": 2.694e-06,
+        "solver_poly_b": 0.7299,
+        "solver_poly_c": 65.731,
+    },
+}
+
+
+def _detected_cost_profile() -> dict[str, float]:
+    """Return the GPU-specific cost profile for device 0, or {} if unknown."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            for key, profile in _GPU_PROFILES.items():
+                if key in name:
+                    return profile
+    except Exception:
+        pass
+    return {}
+
 
 @dataclass
 class MarsConfig:
@@ -58,21 +96,27 @@ class MarsConfig:
     # the original MARS values; re-tune per model/GPU via examples/calibrate_cost.py
     # (the forward-step time model is ~ (cost_a * batch_tokens + cost_c) ms, and
     # cost_max_ragged_batch is the tokens/step where compute saturates).
-    cost_a: float = 0.0463
-    cost_c: float = 10.0
+    # None => auto-filled by __post_init__ from the detected GPU profile.
+    cost_a: float | None = None
+    cost_c: float | None = None
     cost_max_ragged_batch: int = 384
     # Swap-waste coefficients (Phase 6, 3-way Vulcan). Original MARS values;
     # re-profile against the CPU-offload transfer path for real experiments.
-    cost_swap_a1: float = 0.136
+    cost_swap_a1: float | None = None
     cost_swap_a2: float = 0.181
     cost_swap_c: float = 22.5
-    # Dynamic memory-pressure demotion (Greedy / InferCept, and V under
-    # pressure): when KV usage exceeds the threshold and requests are waiting,
-    # demote the cheaper preserved-paused requests (free their KV -> swap /
-    # recompute) so the freed memory can admit waiting work. Mirrors the
-    # original chunk-fill victim selection. Pure 'P' is never demoted.
+    # Dynamic demotion (Greedy / InferCept, and V). Faithful to the original
+    # _schedule_chunk_and_fill: every step, keep only the single highest-waste
+    # preserved-paused request pinned and demote the rest (free their KV -> swap
+    # / recompute) so the freed memory can admit waiting work. Demoting each
+    # request right after it pauses spreads the CPU-offload (PCIe) traffic across
+    # the workload instead of bursting it at a memory wall. Pure 'P' is never
+    # demoted. Gated only on pending admission demand (requests waiting).
     demote_under_pressure: bool = True
-    demote_pressure_threshold: float = 0.9
+    # Optional KV-usage floor for demotion. 0 (default) => faithful original:
+    # demote whenever work is waiting, regardless of usage. >0 => only demote
+    # once usage exceeds this fraction (re-enables the old pressure gate).
+    demote_pressure_threshold: float = 0.0
     # Gurobi solver (decision-only) for the 'V' policy: per pause, solve the
     # optimal KV split and apply the dominant WHOLE-request mode. Coefficients
     # are re-calibrated via examples/calibrate_cost.py (6B reference values from
@@ -80,12 +124,18 @@ class MarsConfig:
     # partial-split -> whole-request discrepancy.
     use_solver: bool = False
     solver_target: float = 1500.0  # SLA target throughput (tokens/s)
-    solver_per_token_swap_latency: float = 4e-5
-    solver_poly_a: float = 1.3e-5  # forward time = (a*x^2 + b*x + c)/1000 ms
-    solver_poly_b: float = 0.328
-    solver_poly_c: float = 24.1
+    solver_per_token_swap_latency: float | None = None
+    solver_poly_a: float | None = None  # forward time = (a*x^2 + b*x + c)/1000 ms
+    solver_poly_b: float | None = None
+    solver_poly_c: float | None = None
     solver_free_swap_tokens: int = 976
     solver_timeout: float = 0.025  # Gurobi TimeLimit (s)
+
+    def __post_init__(self) -> None:
+        profile = {**_GENERIC_COST_DEFAULTS, **_detected_cost_profile()}
+        for k, default in profile.items():
+            if getattr(self, k) is None:
+                object.__setattr__(self, k, default)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "MarsConfig":

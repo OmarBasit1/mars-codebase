@@ -114,7 +114,6 @@ async def main_async(args: argparse.Namespace) -> None:
             policy_config=args.policy_config,
             chunk_fill=args.chunk_fill,
             chunk_size=args.chunk_size,
-            use_solver=args.use_solver,
             starvation_avoidance=args.starvation_avoidance,
             starvation_threshold=args.starvation_threshold,
             starvation_quantum=args.starvation_quantum,
@@ -227,7 +226,6 @@ def main() -> None:
     ap.add_argument("--policy-config", default="fcfs")
     ap.add_argument("--chunk-fill", action="store_true")
     ap.add_argument("--chunk-size", type=int, default=0)
-    ap.add_argument("--use-solver", action="store_true", help="Gurobi solver for 'V'")
     ap.add_argument("--starvation-avoidance", action="store_true")
     ap.add_argument("--starvation-threshold", type=int, default=100)
     ap.add_argument("--starvation-quantum", type=int, default=100000)

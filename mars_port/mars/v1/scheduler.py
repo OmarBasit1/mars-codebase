@@ -224,7 +224,7 @@ class MARSScheduler(Scheduler):
             heuristics (swap arms degraded when swap is unavailable).
           * ``G``/``I`` -> their *static* pause mode (PRESERVE) here; the dynamic
             memory-pressure demotion that distinguishes Greedy / InferCept runs
-            in :meth:`schedule` (``_mars_demote_under_pressure``), where ``I``
+            in :meth:`schedule` (``_mars_demote_paused``), where ``I``
             demotes recompute-only and ``G`` is swap-aware.
           * ``P``/``D``/``S`` -> direct mode (swap degraded when unavailable).
         """
@@ -327,7 +327,7 @@ class MARSScheduler(Scheduler):
             (self.mars_config.demote_under_pressure or self.mars_config.chunk_fill)
             and len(self.mars_paused_preserved) > 1
         ):
-            self._mars_demote_under_pressure()
+            self._mars_demote_paused()
         return super().schedule()
 
     def _mars_starvation_pass(self) -> None:
@@ -370,12 +370,20 @@ class MARSScheduler(Scheduler):
         # (the request is already in mars_starving at this point).
         self.waiting.prepend_request(request)
 
-    def _mars_demote_under_pressure(self) -> None:
-        # Act only with pending admission demand and real KV pressure.
+    def _mars_demote_paused(self) -> None:
+        # Faithful to the original _schedule_chunk_and_fill: every step keep only
+        # the single highest-waste preserved-paused request pinned and demote the
+        # rest. Demoting each request right after it pauses (rather than waiting
+        # for a memory wall) spreads the CPU-offload (PCIe) traffic across the
+        # workload instead of bursting it in one step. Gated only on pending
+        # admission demand -- there is no point freeing KV nothing is waiting for
+        # (v1 reloads at resume, so a needless demote is a wasted host round-trip).
         if not self.waiting:
             return
         usage = self.kv_cache_manager.usage
-        if usage < self.mars_config.demote_pressure_threshold:
+        # Optional usage floor (0 => no gate, the faithful default).
+        threshold = self.mars_config.demote_pressure_threshold
+        if threshold > 0 and usage < threshold:
             return
         # Rank candidates by demote waste; demote all but the costliest one
         # (faithful to the original: keep the single highest-waste request

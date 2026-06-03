@@ -15,13 +15,13 @@ set -euo pipefail
 PY=${PY:-/export2/obasit/MARS_derivative/vllm/.venv/bin/python}
 WL=${WL:-/export2/obasit/MARS_derivative/mars-codebase/diverse_oneapi_merged_exp_uniform.json}
 MODEL=${MODEL:-Qwen/Qwen3-14B}
-WINDOW=${WINDOW:-1800}
+WINDOW=${WINDOW:-30}
 QPS_LIST=${QPS_LIST:-"3 4 5 6"}
-OUT=${OUT:-/tmp/mars_6b}
+OUT=${OUT:-./results/single_api_a40_qwen3_14B}
 GPU=${GPU:-0}
-CPU_GB=${CPU_GB:-32}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
-GPU_MEM=${GPU_MEM:-0.9}
+CPU_GB=${CPU_GB:-64}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-87040}
+GPU_MEM=${GPU_MEM:-0.95}
 DUMMY=${DUMMY:-0}
 EXTRA=${EXTRA:-}
 
@@ -43,7 +43,7 @@ run() {  # tag qps policy-flags...
 
 for q in $QPS_LIST; do
   # MARS: V + V2 queue + chunk-fill + CPU-offload swap + starvation + solver.
-  run MARS "$q" --api-policy V --policy-config V2 --chunk-fill --swap --use-solver \
+  run MARS "$q" --api-policy V --policy-config V2 --chunk-fill --swap \
       --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000
   # InferCept baseline: I + chunk-fill + swap.
   run InferCept "$q" --api-policy I --policy-config fcfs --chunk-fill --swap
