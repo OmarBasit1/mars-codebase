@@ -120,7 +120,27 @@ async def main_async(args: argparse.Namespace) -> None:
             starvation_quantum=args.starvation_quantum,
         ).to_additional_config(),
     )
-    if args.swap:
+    want_swap = args.swap
+    if want_swap:
+        # vLLM's SimpleCPUOffloadConnector is unsupported for hybrid (Mamba/SSM)
+        # models -- the scheduler asserts "External KV connector is not verified"
+        # in _mamba_block_aligned_split. Detect that cheaply (config only, no
+        # weights) and run swap-free (swap policies degrade to recompute).
+        try:
+            probe = AsyncEngineArgs(
+                model=args.model, max_model_len=args.max_model_len,
+                load_format=args.load_format,
+            ).create_engine_config()
+            if probe.model_config.is_hybrid:
+                print(
+                    f"WARNING: '{args.model}' is a hybrid (Mamba) model; the "
+                    f"CPU-offload connector is unsupported -> running SWAP-FREE "
+                    f"(swap policies degrade to recompute)."
+                )
+                want_swap = False
+        except Exception as e:  # be permissive -- worst case the engine errors
+            print(f"WARNING: hybrid-model probe failed ({e}); proceeding with --swap.")
+    if want_swap:
         eng_kwargs["enable_prefix_caching"] = True
         eng_kwargs["kv_transfer_config"] = cpu_offload_kv_transfer_config(args.cpu_gb)
     else:
