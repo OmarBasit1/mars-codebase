@@ -10,7 +10,8 @@ subsystem, what the original did, what the port does, and any **discrepancy**.
 | | Original | Port |
 |---|---|---|
 | Integration | Vendored, edited copy of vLLM 0.2.0 (the `vllm` package *is* MARS) | Extension package on an **unmodified** vLLM v1 (`scheduler_cls`, `extra_args`, native streaming, KV-connector). **Zero vLLM core edits.** |
-| Engine | V0 sync `LLMEngine` + custom `Scheduler` | V1 `EngineCore`; `MARSScheduler(Scheduler)` injected via `scheduler_cls` |
+| Engine | V0 sync `LLMEngine` + custom `Scheduler` | V1 `EngineCore`; MARS overrides injected via `scheduler_cls` |
+| Scheduling mode | Synchronous `engine.step()` loop only | **Both** vLLM modes. `scheduler_cls="…MARSScheduler"` is a dispatch factory: the MARS overrides are a mixin layered on `Scheduler` (sync) or `AsyncScheduler` (overlapped) per the resolved `async_scheduling` flag (default on). Async placeholder bookkeeping is picked up from `AsyncScheduler` via the MRO. |
 
 ## Subsystem-by-subsystem
 

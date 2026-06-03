@@ -16,7 +16,8 @@ def mkreq(name: str, remain: int):
     sp = SamplingParams(
         max_tokens=8, extra_args=MarsApiParams(remain_length=remain).to_extra_args()
     )
-    return SimpleNamespace(name=name, sampling_params=sp)
+    # request_id is read by the queue's starvation-aware key (_MarsHeapQueue._key).
+    return SimpleNamespace(name=name, request_id=name, sampling_params=sp)
 
 
 def main() -> None:

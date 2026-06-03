@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
@@ -63,8 +64,18 @@ class _MarsReqState:
     pending_skip_prefix: bool = False
 
 
-class MARSScheduler(Scheduler):
-    """vLLM v1 scheduler with MARS per-pause KV-cache policies."""
+class _MARSSchedulerMixin:
+    """MARS per-pause KV-cache policy overrides.
+
+    A mixin (no scheduler base of its own) so it can be layered on top of *either*
+    vLLM scheduler base: the synchronous :class:`Scheduler` or the overlapped
+    :class:`AsyncScheduler`. Every override calls ``super()`` so it composes with
+    whichever base it is combined with (see :class:`MARSSyncScheduler` /
+    :class:`MARSAsyncScheduler` and the :class:`MARSScheduler` dispatch factory).
+    Under ``AsyncScheduler`` the base's output-placeholder bookkeeping
+    (``_update_after_schedule`` / ``_update_request_with_output``) is picked up
+    via the MRO, so MARS works correctly with vLLM's async scheduling too.
+    """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -471,3 +482,50 @@ class MARSScheduler(Scheduler):
         self.mars_state.pop(request.request_id, None)
         self.mars_paused_preserved.pop(request.request_id, None)
         return super()._free_request(request, *args, **kwargs)
+
+
+# --- concrete schedulers + dispatch factory --------------------------------
+# vLLM picks the scheduler class from ``scheduler_cls`` *before* it resolves the
+# ``async_scheduling`` flag, and (unlike the no-custom-class path) it never swaps
+# in ``AsyncScheduler`` for a custom class. So we expose a factory under the
+# stable name ``MARSScheduler`` that instantiates the right base per the resolved
+# flag, layering the MARS overrides on top of either base via the MRO.
+
+
+class MARSSyncScheduler(_MARSSchedulerMixin, Scheduler):
+    """MARS over vLLM's synchronous scheduler (``async_scheduling=False``)."""
+
+
+class MARSAsyncScheduler(_MARSSchedulerMixin, AsyncScheduler):
+    """MARS over vLLM's overlapped scheduler (``async_scheduling=True``).
+
+    ``AsyncScheduler`` adds the in-flight-token placeholder bookkeeping that
+    overlapped scheduling needs; the MARS overrides sit above it in the MRO and
+    pick it up through their ``super()`` calls.
+    """
+
+
+class MARSScheduler:
+    """Dispatch factory: select the sync or async MARS scheduler.
+
+    Used as ``scheduler_cls="mars.v1.scheduler.MARSScheduler"``. vLLM instantiates
+    it with all-keyword args (``vllm_config=...`` etc.); we read
+    ``vllm_config.scheduler_config.async_scheduling`` and return a fully built
+    :class:`MARSAsyncScheduler` or :class:`MARSSyncScheduler`. Because those are
+    not subclasses of this factory, Python skips ``MARSScheduler.__init__`` and
+    the chosen class's ``__init__`` is the only one that runs.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        vllm_config = kwargs.get("vllm_config")
+        if vllm_config is None and args:
+            vllm_config = args[0]
+        async_sched = bool(
+            getattr(getattr(vllm_config, "scheduler_config", None),
+                    "async_scheduling", False)
+        )
+        target = MARSAsyncScheduler if async_sched else MARSSyncScheduler
+        logger.info(
+            "[MARS] using %s (async_scheduling=%s)", target.__name__, async_sched
+        )
+        return target(*args, **kwargs)
