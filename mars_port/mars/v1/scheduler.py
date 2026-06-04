@@ -176,6 +176,14 @@ class _MARSSchedulerMixin:
             )
         # Gate combined-queue overrides on MARS queues actually being active.
         self._mars_queues: bool = isinstance(self.waiting, _MarsHeapQueue)
+        # Async scheduling pipelines outputs: a request scheduled in a prior step
+        # is still in flight (its KV blocks are referenced by an un-retired batch)
+        # when the next step's MARS pre-pass runs. Freeing those blocks then (a
+        # demotion) corrupts the in-flight batch and wedges the engine. Track the
+        # mode so the demotion pre-pass can defer in-flight requests by a step.
+        self._async_sched: bool = bool(
+            getattr(self.scheduler_config, "async_scheduling", False)
+        )
         # Observability counters (read by tests / logged).
         self.mars_total_pauses = 0
         self.mars_preserve_count = 0
@@ -566,6 +574,7 @@ class _MARSSchedulerMixin:
         demotable = [
             (waste, rid, req, mode)
             for rid, req in self.mars_paused_preserved.items()
+            if not self._mars_request_inflight(req)
             for mode, waste in [self._demote_choice(rid, req)]
             if mode is not None
         ]
@@ -574,6 +583,25 @@ class _MARSSchedulerMixin:
         demotable.sort(key=lambda x: x[0])
         for waste, rid, req, mode in demotable[:-1]:  # all but the costliest
             self._demote(rid, req, mode, waste, usage)
+
+    def _mars_request_inflight(self, request: Request) -> bool:
+        """True if the request still has async outputs in flight.
+
+        Under async scheduling the engine schedules the next batch before the
+        previous one retires, so a request scheduled in a prior step still has
+        its KV blocks referenced by an un-retired batch (tracked by
+        ``num_output_placeholders`` and ``prev_step_scheduled_req_ids``). Freeing
+        those blocks now -- e.g. a demotion -- corrupts the in-flight batch and
+        wedges the engine. Deferring the free by one step (until the in-flight
+        outputs drain) is safe and faithful. Always ``False`` under sync
+        scheduling (no pipeline window), so this is a no-op there.
+        """
+        if getattr(request, "num_output_placeholders", 0) > 0:
+            return True
+        return (
+            self._async_sched
+            and request.request_id in self.prev_step_scheduled_req_ids
+        )
 
     def _demote_choice(self, rid: str, request: Request):
         """``(mode, waste)`` to demote a preserved-paused request, from classify().

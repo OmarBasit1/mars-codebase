@@ -105,10 +105,12 @@ async def main_async(args: argparse.Namespace) -> None:
     eng_kwargs = dict(
         model=args.model,
         enforce_eager=True,
+        seed=args.seed,  # deterministic engine sampling => repeatable per (qps, seed)
         gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len,
         load_format=args.load_format,
         disable_hybrid_kv_cache_manager=True,
+        async_scheduling=not args.sync_scheduling,
         scheduler_cls="mars.v1.scheduler.MARSScheduler",
         additional_config=MarsConfig(
             api_policy=args.api_policy,
@@ -230,6 +232,8 @@ def main() -> None:
     ap.add_argument("--starvation-avoidance", action="store_true")
     ap.add_argument("--starvation-threshold", type=int, default=100)
     ap.add_argument("--starvation-quantum", type=int, default=100000)
+    ap.add_argument("--sync-scheduling", action="store_true",
+                    help="force synchronous scheduling (async_scheduling=False)")
     ap.add_argument("--swap", action="store_true", help="enable SimpleCPUOffloadConnector")
     ap.add_argument("--cpu-gb", type=float, default=4.0)
     ap.add_argument("--prefix-cache", action="store_true")
