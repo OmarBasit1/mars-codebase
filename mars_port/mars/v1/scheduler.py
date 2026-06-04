@@ -24,6 +24,7 @@ produce identical output tokens (verified by the Phase 3 smoke test).
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 
@@ -206,6 +207,46 @@ class _MARSSchedulerMixin:
             self.mars_config.chunk_fill,
             self.mars_config.per_req_stats_path or "(disabled)",
         )
+        # Optional hang diagnostic (env-gated, no overhead when off): a daemon
+        # thread that every MARS_HANG_DIAG seconds logs queue/memory state so a
+        # stall can be characterised (slow-drain vs memory deadlock) without
+        # ptrace/py-spy. Also arms a periodic faulthandler traceback dump.
+        if os.environ.get("MARS_HANG_DIAG"):
+            self._start_hang_diag(int(os.environ["MARS_HANG_DIAG"]))
+
+    def _start_hang_diag(self, interval: int) -> None:
+        import threading
+
+        def _diag():
+            import time as _t
+            while True:
+                _t.sleep(interval)
+                try:
+                    w = len(self.waiting)
+                    sw = len(self.skipped_waiting)
+                    run = len(self.running)
+                    pp = len(self.mars_paused_preserved)
+                    usage = getattr(self.kv_cache_manager, "usage", -1)
+                    # count schedulable (WAITING) vs parked in skipped_waiting
+                    sched = parked = 0
+                    if isinstance(self.skipped_waiting, _MarsHeapQueue):
+                        for r in self.skipped_waiting.iter_unsorted():
+                            if r.status == RequestStatus.WAITING:
+                                sched += 1
+                            else:
+                                parked += 1
+                    logger.info(
+                        "[MARS-DIAG] running=%d waiting=%d skipped=%d "
+                        "(sched=%d parked=%d) paused_preserved=%d kv_usage=%.3f "
+                        "demotions=%d swap_reloads=%d",
+                        run, w, sw, sched, parked, pp, usage,
+                        self.mars_demotions, self.mars_swap_reloads,
+                    )
+                except Exception as e:
+                    logger.info("[MARS-DIAG] error: %r", e)
+
+        t = threading.Thread(target=_diag, daemon=True, name="mars-hang-diag")
+        t.start()
 
     # --- policy resolution -------------------------------------------------
 
@@ -448,11 +489,25 @@ class _MARSSchedulerMixin:
         cheap placeholder that this overwrites). Both ``waiting`` and
         ``skipped_waiting`` are re-keyed so resumed swap requests in
         ``skipped_waiting`` compete under the same live score — replicating the
-        original's combined swapped+waiting sort. ``n`` is bounded by
-        ``max_num_seqs`` (≤512), so the heapify cost is negligible.
+        original's combined swapped+waiting sort.
+
+        Only *schedulable* (``WAITING``) requests get a live V2 score. Parked
+        API requests (``WAITING_FOR_STREAMING_REQ`` / ``WAITING_FOR_REMOTE_KVS``)
+        sit in ``skipped_waiting`` until they resume and cannot be admitted, so
+        re-parsing + re-scoring them every step is pure waste — and pathological
+        at high qps, where thousands park at the tail (``skipped_waiting`` is NOT
+        bounded by ``max_num_seqs``). They get a cheap ``+inf`` key (sorted to the
+        back, behind every schedulable request) instead. This avoids an O(n)
+        ``MarsApiParams`` parse per step that otherwise pegs a CPU core and
+        stalls the engine. See COMPARISON.md.
         """
         running_batch, running_blocks = self._running_contention()
-        key_fn = lambda r: self._v2_score(r, running_batch, running_blocks)
+
+        def key_fn(r: Request) -> float:
+            if r.status != RequestStatus.WAITING:
+                return float("inf")  # parked: not admittable; skip the score+parse
+            return self._v2_score(r, running_batch, running_blocks)
+
         for q in (self.waiting, self.skipped_waiting):
             if isinstance(q, _MarsHeapQueue) and q:
                 q.rekey(key_fn)
@@ -520,7 +575,16 @@ class _MARSSchedulerMixin:
         if self._mars_queues:
             queues.append(self.skipped_waiting)
         for queue in queues:
-            for req in list(queue):
+            # iter_unsorted (MARS heaps) avoids the O(n log n) sort of
+            # list(queue)/__iter__; order is irrelevant here (we only scan +
+            # boost by status), and at high qps skipped_waiting holds thousands
+            # of parked requests. Native FCFS queues fall back to plain iteration.
+            scan = (
+                queue.iter_unsorted()
+                if isinstance(queue, _MarsHeapQueue)
+                else list(queue)
+            )
+            for req in scan:
                 if req.status != RequestStatus.WAITING:
                     continue  # parked / in-KV-transfer: skip
                 rid = req.request_id

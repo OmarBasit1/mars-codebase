@@ -146,6 +146,16 @@ class _MarsHeapQueue(RequestQueue):
         for _, _, request in sorted(self._heap):
             yield request
 
+    def iter_unsorted(self) -> Iterator[Request]:
+        """Yield requests in heap (arbitrary) order — O(n), no sort.
+
+        For hot-path scans that don't need priority order (e.g. the per-step
+        starvation pass), this avoids the O(n log n) ``sorted()`` in ``__iter__``.
+        Iterates a snapshot so callers may mutate the queue while iterating.
+        """
+        for _, _, request in list(self._heap):
+            yield request
+
 
 class MARSRequestQueue(_MarsHeapQueue):
     """Shortest-Job-First queue (keyed on MARS ``remain_length``)."""
