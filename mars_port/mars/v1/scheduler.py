@@ -23,6 +23,7 @@ produce identical output tokens (verified by the Phase 3 smoke test).
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 
@@ -75,6 +76,7 @@ class _MarsReqState:
     # always PRESERVEs; the strategy is applied only at demotion.
     arrival_strategy: str = ""  # "preserve" / "recompute" / "swap"
     arrival_waste: float = 0.0
+    swap_reloads: int = 0  # times KV was reloaded from CPU (SWAP resumes)
 
 
 class _MARSSchedulerMixin:
@@ -196,12 +198,13 @@ class _MARSSchedulerMixin:
         self.mars_demotions = 0
         logger.info(
             "[MARS] scheduler active: api_policy=%s policy_config=%s "
-            "swap_available=%s block_size=%s chunk_fill=%s",
+            "swap_available=%s block_size=%s chunk_fill=%s per_req_stats=%r",
             self.mars_config.api_policy,
             self.mars_config.policy_config,
             self._swap_available,
             self._block_size,
             self.mars_config.chunk_fill,
+            self.mars_config.per_req_stats_path or "(disabled)",
         )
 
     # --- policy resolution -------------------------------------------------
@@ -666,6 +669,7 @@ class _MARSSchedulerMixin:
                 # The connector will serve KV from host asynchronously
                 # (WAITING_FOR_REMOTE_KVS overlap) when the request is next admitted.
                 self.mars_swap_reloads += 1
+                st.swap_reloads += 1
                 logger.info(
                     "[MARS] swap reload req=%s (async host->GPU via connector)",
                     session.request_id,
@@ -676,8 +680,22 @@ class _MARSSchedulerMixin:
     # --- cleanup -----------------------------------------------------------
 
     def _free_request(self, request: Request, *args, **kwargs):
-        self.mars_state.pop(request.request_id, None)
+        st = self.mars_state.pop(request.request_id, None)
         self.mars_paused_preserved.pop(request.request_id, None)
+        path = self.mars_config.per_req_stats_path
+        if path and st is not None:
+            # vLLM appends "-{8hex}" to every request_id for internal uniqueness
+            # (input_processor.py:240).  Strip the suffix so the bench can look up
+            # records by the original caller-supplied ID.
+            rid = request.request_id
+            ext_id = rid.rsplit("-", 1)[0] if len(rid) > 9 and rid[-9] == "-" else rid
+            with open(path, "a") as _f:
+                _f.write(json.dumps({
+                    "request_id": ext_id,
+                    "policy": st.policy_letter,
+                    "arrival_strategy": st.arrival_strategy or "preserve",
+                    "swap_reloads": st.swap_reloads,
+                }) + "\n")
         return super()._free_request(request, *args, **kwargs)
 
 

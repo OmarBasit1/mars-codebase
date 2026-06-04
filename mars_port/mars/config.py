@@ -130,6 +130,10 @@ class MarsConfig:
     solver_poly_c: float | None = None
     solver_free_swap_tokens: int = 976
     solver_timeout: float = 0.025  # Gurobi TimeLimit (s)
+    # Path to a JSONL sidecar file where the scheduler writes one record per
+    # finished request (policy, arrival_strategy, swap_reloads).  Empty = disabled.
+    # Set by the bench harness so it can enrich the per-request CSV.
+    per_req_stats_path: str = ""
 
     def __post_init__(self) -> None:
         profile = {**_GENERIC_COST_DEFAULTS, **_detected_cost_profile()}

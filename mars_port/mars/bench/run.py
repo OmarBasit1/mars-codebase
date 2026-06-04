@@ -21,6 +21,7 @@ import asyncio
 import csv
 import json
 import random
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -102,6 +103,11 @@ async def main_async(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
     offsets = np.cumsum(rng.exponential(1.0 / args.qps, size=num_requests))
 
+    # Sidecar JSONL: the MARS scheduler writes one record per finished request
+    # (policy, arrival_strategy, swap_reloads).  Read after engine.shutdown().
+    _stats_fd, stats_path = tempfile.mkstemp(prefix="mars_req_stats_", suffix=".jsonl")
+    os.close(_stats_fd)
+
     eng_kwargs = dict(
         model=args.model,
         enforce_eager=True,
@@ -120,6 +126,7 @@ async def main_async(args: argparse.Namespace) -> None:
             starvation_avoidance=args.starvation_avoidance,
             starvation_threshold=args.starvation_threshold,
             starvation_quantum=args.starvation_quantum,
+            per_req_stats_path=stats_path,
         ).to_additional_config(),
     )
     want_swap = args.swap
@@ -173,6 +180,23 @@ async def main_async(args: argparse.Namespace) -> None:
     wall = time.perf_counter() - t0
     engine.shutdown()
 
+    # Read per-request MARS stats written by the scheduler into the sidecar JSONL.
+    req_mars: dict[str, dict] = {}
+    try:
+        with open(stats_path) as _sf:
+            for line in _sf:
+                line = line.strip()
+                if line:
+                    rec = json.loads(line)
+                    req_mars[rec["request_id"]] = rec
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(stats_path)
+        except Exception:
+            pass
+
     # --- metrics ---
     finished = [r for r in results if r.finished]
     total_gen = sum(r.total_generated for r in finished)
@@ -193,8 +217,12 @@ async def main_async(args: argparse.Namespace) -> None:
                 ttft.append(ttft_i)
             if r.total_generated:
                 norm_lat.append(nl_i)
+        mars_rec = req_mars.get(r.request_id, {})
         rows.append([r.request_id, r.finished, r.pauses, r.total_generated,
-                     f"{plan.api_wait:.4f}", f"{e2e_i:.4f}", f"{ttft_i:.4f}", f"{nl_i:.6f}"])
+                     f"{plan.api_wait:.4f}", f"{e2e_i:.4f}", f"{ttft_i:.4f}", f"{nl_i:.6f}",
+                     mars_rec.get("policy", ""),
+                     mars_rec.get("arrival_strategy", ""),
+                     mars_rec.get("swap_reloads", "")])
 
     print("=" * 56)
     print(f"policy={args.api_policy} policy_config={args.policy_config} "
@@ -212,7 +240,8 @@ async def main_async(args: argparse.Namespace) -> None:
         with open(args.csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["request_id", "finished", "pauses", "gen_tokens",
-                        "api_wait_s", "e2e_s", "ttft_s", "norm_lat_s_per_tok"])
+                        "api_wait_s", "e2e_s", "ttft_s", "norm_lat_s_per_tok",
+                        "kv_policy", "arrival_strategy", "swap_reloads"])
             w.writerows(rows)
         print(f"wrote per-request CSV -> {args.csv}")
 
