@@ -78,6 +78,7 @@ class _MarsReqState:
     arrival_strategy: str = ""  # "preserve" / "recompute" / "swap"
     arrival_waste: float = 0.0
     swap_reloads: int = 0  # times KV was reloaded from CPU (SWAP resumes)
+    remaining_quantum: int = 0  # starvation-boost steps left (0 = not boosted)
 
 
 class _MARSSchedulerMixin:
@@ -197,6 +198,17 @@ class _MARSSchedulerMixin:
         # memory-pressure demotion.
         self.mars_paused_preserved: dict[str, Request] = {}
         self.mars_demotions = 0
+        # Resumed-PRESERVE requests: still hold KV blocks but are back in
+        # skipped_waiting/waiting (no longer in mars_paused_preserved). These are
+        # the deadlock culprits at high qps: vLLM's native preemption only evicts
+        # running requests, so when memory fills with running=0 nothing can be
+        # admitted. _reclaim_blocks_for_admission evicts the lowest-priority victim
+        # from this pool, mirroring the original's passive_discard over
+        # combined_targets.
+        self.mars_resumed_preserved: dict[str, Request] = {}
+        self.mars_reclaims = 0  # passive_discard invocations
+        # V2 amortization counter (C2): rekey only every rekey_interval steps.
+        self._mars_rekey_counter: int = 0
         logger.info(
             "[MARS] scheduler active: api_policy=%s policy_config=%s "
             "swap_available=%s block_size=%s chunk_fill=%s per_req_stats=%r",
@@ -235,12 +247,15 @@ class _MARSSchedulerMixin:
                                 sched += 1
                             else:
                                 parked += 1
+                    rp = len(self.mars_resumed_preserved)
                     logger.info(
                         "[MARS-DIAG] running=%d waiting=%d skipped=%d "
-                        "(sched=%d parked=%d) paused_preserved=%d kv_usage=%.3f "
-                        "demotions=%d swap_reloads=%d",
-                        run, w, sw, sched, parked, pp, usage,
-                        self.mars_demotions, self.mars_swap_reloads,
+                        "(sched=%d parked=%d) paused_preserved=%d "
+                        "resumed_preserved=%d kv_usage=%.3f "
+                        "demotions=%d reclaims=%d swap_reloads=%d",
+                        run, w, sw, sched, parked, pp, rp, usage,
+                        self.mars_demotions, self.mars_reclaims,
+                        self.mars_swap_reloads,
                     )
                 except Exception as e:
                     logger.info("[MARS-DIAG] error: %r", e)
@@ -434,15 +449,27 @@ class _MARSSchedulerMixin:
 
     def schedule(self):
         # Pre-pass before the base scheduler admits/preempts:
+        #  0. clean up mars_resumed_preserved for requests that became RUNNING or
+        #     FINISHED since the last step (they were admitted or finished normally).
         #  1. starvation — boost long-waiting requests to the front;
         #  2. V2 re-key — re-rank the waiting queue with the live running_batch;
         #  3. demotion — apply the arrival-classified strategy to preserved KV.
+        if self.mars_resumed_preserved:
+            done = [
+                rid for rid, req in self.mars_resumed_preserved.items()
+                if req.status != RequestStatus.WAITING
+            ]
+            for rid in done:
+                self.mars_resumed_preserved.pop(rid, None)
         if self.mars_config.starvation_avoidance:
             self._mars_starvation_pass()
-        # Re-rank V2 with the live running_batch each step (after starvation so
-        # the -inf boosts survive), faithful to the original per-step re-sort.
+        # Re-rank V2 with the live running_batch every rekey_interval steps
+        # (faithful to the original's skip_sorting_for_this_number_of_iterations).
         if self.mars_config.policy_config == "V2":
-            self._mars_rekey_v2()
+            self._mars_rekey_counter += 1
+            if self._mars_rekey_counter >= self.mars_config.rekey_interval:
+                self._mars_rekey_counter = 0
+                self._mars_rekey_v2()
         # chunk_fill (the original's switch for the demotion machinery) or the
         # explicit demote_under_pressure knob enables dynamic demotion.
         if (
@@ -568,8 +595,10 @@ class _MARSSchedulerMixin:
         order (the original's ``quantum`` is "boosted until scheduled").
         """
         threshold = self.mars_config.starvation_threshold
+        quantum = self.mars_config.starvation_quantum  # steps to keep boosted
         waiting_ids: set[str] = set()
         boosted = 0
+        expired = 0
         # Scan both queues; only count requests that are currently schedulable.
         queues = [self.waiting]
         if self._mars_queues:
@@ -589,12 +618,25 @@ class _MARSSchedulerMixin:
                     continue  # parked / in-KV-transfer: skip
                 rid = req.request_id
                 waiting_ids.add(rid)
+                st = self.mars_state.get(rid)
                 if rid in self.mars_starving:
+                    # Quantum countdown: decrement each step while boosted.
+                    if st is not None and st.remaining_quantum > 0:
+                        st.remaining_quantum -= 1
+                        if st.remaining_quantum == 0:
+                            # Quantum expired: un-boost and reset wait counter so
+                            # the request has a fresh chance before re-boosting.
+                            self.mars_starving.discard(rid)
+                            self.mars_wait_counter.pop(rid, None)
+                            self._mars_boost(req, queue)  # re-insert with normal key
+                            expired += 1
                     continue
                 count = self.mars_wait_counter.get(rid, 0) + 1
                 self.mars_wait_counter[rid] = count
                 if count > threshold:
                     self.mars_starving.add(rid)
+                    if st is not None:
+                        st.remaining_quantum = max(1, quantum)
                     self._mars_boost(req, queue)
                     boosted += 1
         # Drop bookkeeping for requests that left waiting (scheduled/finished).
@@ -604,6 +646,8 @@ class _MARSSchedulerMixin:
                 self.mars_starving.discard(rid)
         if boosted:
             logger.info("[MARS] starvation: boosted %d request(s) to front", boosted)
+        if expired:
+            logger.debug("[MARS] starvation: quantum expired for %d request(s)", expired)
 
     def _mars_boost(self, request: Request, queue=None) -> None:
         # Remove from the source queue (which was already determined by the
@@ -670,6 +714,56 @@ class _MARSSchedulerMixin:
             and request.request_id in self.prev_step_scheduled_req_ids
         )
 
+    def _reclaim_blocks_for_admission(
+        self, request: Request, num_new_tokens: int
+    ) -> bool:
+        """Passive-discard: free the lowest-priority KV-holding waiting request.
+
+        Called by the base when allocate_slots returns None for a waiting
+        request.  Picks the victim with the smallest V2 waste (least worth
+        keeping) from ``mars_resumed_preserved`` (resumed-PRESERVE requests that
+        still hold GPU blocks but are waiting, not running — the deadlock
+        culprits), frees its KV, and returns True so the base retries admission.
+        Returns False when no eligible victim exists (base falls back to break).
+
+        Mirrors the original's ``passive_discard_by_order`` over
+        ``combined_targets`` — the safety net that made the original immune to
+        this deadlock.
+        """
+        if not self.mars_resumed_preserved:
+            return False
+        usage = self.kv_cache_manager.usage
+        # Build candidate list: resumed-PRESERVE, WAITING, not in-flight,
+        # not the request being admitted itself.
+        admit_id = request.request_id
+        candidates = [
+            (self._v2_score(req, 0, 0), rid, req)
+            for rid, req in self.mars_resumed_preserved.items()
+            if rid != admit_id
+            and req.status == RequestStatus.WAITING
+            and not self._mars_request_inflight(req)
+        ]
+        if not candidates:
+            return False
+        # Evict the LOWEST priority (highest V2 score = least worth keeping).
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _, victim_rid, victim = candidates[0]
+        mode, waste = self._demote_choice(victim_rid, victim)
+        if mode is None:
+            # arrival_strategy == 'preserve': fall back to recompute so we
+            # actually free something (matches the original's fallback).
+            mode = PauseMode.RECOMPUTE
+            waste = 0.0
+        self._demote(victim_rid, victim, mode, waste, usage)
+        self.mars_reclaims += 1
+        logger.info(
+            "[MARS] reclaim: freed KV of req=%s (mode=%s) to admit req=%s",
+            victim_rid,
+            mode.value,
+            admit_id,
+        )
+        return True
+
     def _demote_choice(self, rid: str, request: Request):
         """``(mode, waste)`` to demote a preserved-paused request, from classify().
 
@@ -703,6 +797,7 @@ class _MARSSchedulerMixin:
             st.pending_skip_prefix = self.mars_config.recompute_skip_prefix_cache
             self.mars_recompute_count += 1
         self.mars_paused_preserved.pop(rid, None)
+        self.mars_resumed_preserved.pop(rid, None)
         self.mars_demotions += 1
         logger.info(
             "[MARS] demote req=%s -> %s waste=%.4g (usage=%.2f, %d preserved left)",
@@ -720,6 +815,11 @@ class _MARSSchedulerMixin:
         # Resuming -> no longer a preserved-paused demotion candidate.
         self.mars_paused_preserved.pop(session.request_id, None)
         st = self.mars_state.get(session.request_id)
+        if st is not None and not st.pending_reset:
+            # KV blocks were NOT freed at pause (PRESERVE mode). The request
+            # resumes holding its GPU blocks; track it so passive_discard can
+            # reclaim them if memory is exhausted during admission.
+            self.mars_resumed_preserved[session.request_id] = session
         if st is not None and st.pending_reset:
             # Blocks were released at the pause. Recompute from num_computed=0;
             # SWAP lets the prefix cache / CPU-offload host serve the prefix back,
@@ -746,6 +846,7 @@ class _MARSSchedulerMixin:
     def _free_request(self, request: Request, *args, **kwargs):
         st = self.mars_state.pop(request.request_id, None)
         self.mars_paused_preserved.pop(request.request_id, None)
+        self.mars_resumed_preserved.pop(request.request_id, None)
         path = self.mars_config.per_req_stats_path
         if path and st is not None:
             # vLLM appends "-{8hex}" to every request_id for internal uniqueness

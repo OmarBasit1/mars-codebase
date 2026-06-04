@@ -66,6 +66,14 @@ class OrchestratorResult:
     start_time: float = 0.0
     first_token_time: float = 0.0
     end_time: float = 0.0
+    # Per-pause timing for the B measurement (proactive preload feasibility):
+    #   resume_times[i]  = perf_counter() right after API inject for pause i
+    #   post_resume_first_token_times[i] = perf_counter() when first token
+    #       of segment i+1 arrives after the resume.
+    # post_resume_ttft[i] = post_resume_first_token_times[i] - resume_times[i]
+    # is the per-pause latency from API-return to first generated token.
+    resume_times: list[float] = field(default_factory=list)
+    post_resume_first_token_times: list[float] = field(default_factory=list)
 
 
 class ApiOrchestrator:
@@ -155,6 +163,8 @@ class ApiOrchestrator:
                 # At least one token: the engine rejects empty prompts, so an
                 # API that returns nothing still injects a single resume marker.
                 api_tokens = [self.api_result_token] * max(1, seg.api_return_length)
+                result.resume_times.append(time.perf_counter())
+                result.post_resume_first_token_times.append(0.0)
                 # Inject the API result + params for the next segment; the engine
                 # folds prior output into the prompt, appends these, and resumes.
                 yield StreamingInput(
@@ -171,8 +181,15 @@ class ApiOrchestrator:
         async for out in self.engine.generate(input_stream(), base_sp, request_id):
             if out.outputs:
                 toks = list(out.outputs[0].token_ids)  # DELTA: new tokens only
+                now = time.perf_counter()
                 if toks and result.first_token_time == 0.0:
-                    result.first_token_time = time.perf_counter()
+                    result.first_token_time = now
+                # Capture first token after each resume (seg_idx > 0 and the list
+                # slot is still 0.0 means we just resumed this segment).
+                if (toks and seg_idx > 0
+                        and seg_idx <= len(result.post_resume_first_token_times)
+                        and result.post_resume_first_token_times[seg_idx - 1] == 0.0):
+                    result.post_resume_first_token_times[seg_idx - 1] = now
                 result.segment_tokens[seg_idx].extend(toks)
                 seg_count += len(toks)
                 result.total_generated += len(toks)

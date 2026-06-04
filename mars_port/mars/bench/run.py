@@ -218,11 +218,19 @@ async def main_async(args: argparse.Namespace) -> None:
             if r.total_generated:
                 norm_lat.append(nl_i)
         mars_rec = req_mars.get(r.request_id, {})
+        # post_resume_ttft: mean seconds from API-return to first token per pause.
+        pr_ttfts = [
+            (ft - rt)
+            for rt, ft in zip(r.resume_times, r.post_resume_first_token_times)
+            if ft > 0 and rt > 0
+        ]
+        pr_ttft_mean = float(np.mean(pr_ttfts)) if pr_ttfts else float("nan")
         rows.append([r.request_id, r.finished, r.pauses, r.total_generated,
                      f"{plan.api_wait:.4f}", f"{e2e_i:.4f}", f"{ttft_i:.4f}", f"{nl_i:.6f}",
                      mars_rec.get("policy", ""),
                      mars_rec.get("arrival_strategy", ""),
-                     mars_rec.get("swap_reloads", "")])
+                     mars_rec.get("swap_reloads", ""),
+                     f"{pr_ttft_mean:.4f}" if not np.isnan(pr_ttft_mean) else ""])
 
     print("=" * 56)
     print(f"policy={args.api_policy} policy_config={args.policy_config} "
@@ -241,7 +249,8 @@ async def main_async(args: argparse.Namespace) -> None:
             w = csv.writer(f)
             w.writerow(["request_id", "finished", "pauses", "gen_tokens",
                         "api_wait_s", "e2e_s", "ttft_s", "norm_lat_s_per_tok",
-                        "kv_policy", "arrival_strategy", "swap_reloads"])
+                        "kv_policy", "arrival_strategy", "swap_reloads",
+                        "post_resume_ttft_s"])
             w.writerows(rows)
         print(f"wrote per-request CSV -> {args.csv}")
 

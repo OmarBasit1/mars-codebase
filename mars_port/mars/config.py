@@ -134,6 +134,12 @@ class MarsConfig:
     # finished request (policy, arrival_strategy, swap_reloads).  Empty = disabled.
     # Set by the bench harness so it can enrich the per-request CSV.
     per_req_stats_path: str = ""
+    # V2 re-key amortization: re-rank the V2 heaps every N schedule() calls
+    # instead of every step.  Faithful to the original's
+    # skip_sorting_for_this_number_of_iterations; default 1 = every step.
+    # Higher values reduce per-step CPU at large queue sizes; stale keys between
+    # rekeys are acceptable (the original used N≈8 without measurable effect).
+    rekey_interval: int = 1
 
     def __post_init__(self) -> None:
         profile = {**_GENERIC_COST_DEFAULTS, **_detected_cost_profile()}
