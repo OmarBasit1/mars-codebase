@@ -7,7 +7,7 @@ MODEL=${MODEL:-Qwen/Qwen2.5-14B-Instruct}
 WINDOW=${WINDOW:-300}
 QPS_LIST=${QPS_LIST:-"11 9 7 5 3"}
 OUT=${OUT:-./results/single_api_a40_qwen2.5_14b}
-GPU=${GPU:-0}
+GPU=${GPU:-1}
 CPU_GB=${CPU_GB:-32}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
 GPU_MEM=${GPU_MEM:-0.95}
@@ -33,12 +33,12 @@ run() {  # tag qps policy-flags...
 }
 
 for q in $QPS_LIST; do
-  # MARS: V + V2 queue + chunk-fill (token budget 1024) + CPU-offload swap + starvation.
-  run MARS_async "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
-      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000
-    # MARS: V + V2 queue + chunk-fill + CPU-offload swap + starvation. 
-  run MARS_no_chunk_async "$q" --api-policy V --policy-config V2 --swap \
-      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000
+  # # MARS: V + V2 queue + chunk-fill (token budget 1024) + CPU-offload swap + starvation.
+  # run MARS_async "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
+  #     --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000
+  #   # MARS: V + V2 queue + chunk-fill + CPU-offload swap + starvation. 
+  # run MARS_no_chunk_async "$q" --api-policy V --policy-config V2 --swap \
+  #     --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000
   # Vanilla vLLM baseline: discard (recompute) + FCFS.
   run Discard_async "$q" --api-policy D --policy-config fcfs
   # Always preserve
@@ -46,12 +46,12 @@ for q in $QPS_LIST; do
   # Always swap
   run Swap_async "$q" --api-policy S --policy-config fcfs --swap
 
-  # MARS: V + V2 queue + chunk-fill (token budget 1024) + CPU-offload swap + starvation.
-  run MARS_sync "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
-      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling
-    # MARS: V + V2 queue + chunk-fill + CPU-offload swap + starvation. 
-  run MARS_no_chunk_sync "$q" --api-policy V --policy-config V2 --swap \
-      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling
+  # # MARS: V + V2 queue + chunk-fill (token budget 1024) + CPU-offload swap + starvation.
+  # run MARS_sync "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
+  #     --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling
+  #   # MARS: V + V2 queue + chunk-fill + CPU-offload swap + starvation. 
+  # run MARS_no_chunk_sync "$q" --api-policy V --policy-config V2 --swap \
+  #     --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling
   # Vanilla vLLM baseline: discard (recompute) + FCFS.
   run Discard_sync "$q" --api-policy D --policy-config fcfs --sync-scheduling
   # Always preserve
