@@ -248,12 +248,20 @@ class _MARSSchedulerMixin:
                             else:
                                 parked += 1
                     rp = len(self.mars_resumed_preserved)
+                    kv_wait = kv_wfrkv = 0
+                    if isinstance(self.skipped_waiting, _MarsHeapQueue):
+                        for _r in self.skipped_waiting.iter_unsorted():
+                            if _r.status == RequestStatus.WAITING and _r.num_computed_tokens > 0:
+                                kv_wait += 1
+                            elif _r.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                                kv_wfrkv += 1
                     logger.info(
                         "[MARS-DIAG] running=%d waiting=%d skipped=%d "
                         "(sched=%d parked=%d) paused_preserved=%d "
-                        "resumed_preserved=%d kv_usage=%.3f "
+                        "resumed_preserved=%d kv_holders_sched=%d "
+                        "kv_holders_wfrkv=%d kv_usage=%.3f "
                         "demotions=%d reclaims=%d swap_reloads=%d",
-                        run, w, sw, sched, parked, pp, rp, usage,
+                        run, w, sw, sched, parked, pp, rp, kv_wait, kv_wfrkv, usage,
                         self.mars_demotions, self.mars_reclaims,
                         self.mars_swap_reloads,
                     )
@@ -714,6 +722,42 @@ class _MARSSchedulerMixin:
             and request.request_id in self.prev_step_scheduled_req_ids
         )
 
+    def _mars_kv_holding_waiting(self) -> list[tuple[str, Request]]:
+        """Return all WAITING requests that currently hold GPU KV blocks.
+
+        Covers two classes:
+        1. ``mars_resumed_preserved``: resumed with PRESERVE KV intact
+           (``pending_reset=False`` at resume).
+        2. Requests in ``skipped_waiting`` with ``num_computed_tokens > 0``:
+           went through ``WAITING_FOR_REMOTE_KVS`` (async KV reload allocated
+           blocks) and returned to WAITING with those blocks resident.
+
+        Both classes hold GPU memory that can be freed (at the cost of a future
+        reload/recompute) to unblock admission.
+        """
+        seen: set[str] = set()
+        result: list[tuple[str, Request]] = []
+        for rid, req in self.mars_resumed_preserved.items():
+            if req.status == RequestStatus.WAITING and not self._mars_request_inflight(req):
+                seen.add(rid)
+                result.append((rid, req))
+        if self._mars_queues and self.skipped_waiting:
+            for req in self.skipped_waiting.iter_unsorted():
+                rid = req.request_id
+                st = self.mars_state.get(rid)
+                # skip if already demoted (pending_reset=True means blocks freed)
+                if st is not None and st.pending_reset:
+                    continue
+                if rid not in seen and not self._mars_request_inflight(req):
+                    if (req.status == RequestStatus.WAITING
+                            and req.num_computed_tokens > 0):
+                        result.append((rid, req))
+                    elif req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                        # In-progress async KV loads also hold GPU blocks; include
+                        # them so the reclaim can cancel the load and free memory.
+                        result.append((rid, req))
+        return result
+
     def _reclaim_blocks_for_admission(
         self, request: Request, num_new_tokens: int
     ) -> bool:
@@ -721,31 +765,34 @@ class _MARSSchedulerMixin:
 
         Called by the base when allocate_slots returns None for a waiting
         request.  Picks the victim with the smallest V2 waste (least worth
-        keeping) from ``mars_resumed_preserved`` (resumed-PRESERVE requests that
-        still hold GPU blocks but are waiting, not running — the deadlock
-        culprits), frees its KV, and returns True so the base retries admission.
+        keeping) from all WAITING requests that hold GPU KV blocks:
+          - ``mars_resumed_preserved``: never-demoted PRESERVE holders.
+          - WAITING requests in ``skipped_waiting`` with ``num_computed_tokens>0``:
+            went through ``WAITING_FOR_REMOTE_KVS`` and hold reloaded blocks.
+        Frees the victim's KV and returns True so the base retries admission.
         Returns False when no eligible victim exists (base falls back to break).
 
         Mirrors the original's ``passive_discard_by_order`` over
         ``combined_targets`` — the safety net that made the original immune to
-        this deadlock.
+        memory-over-commit deadlocks.
         """
-        if not self.mars_resumed_preserved:
+        # Only intervene when running=0 (true deadlock: vLLM's native
+        # running-queue preemption has no victims). When running > 0, native
+        # preemption already handles memory pressure; intervening causes a
+        # free→re-admit→re-hold churn cycle that makes things worse.
+        if len(self.running) > 0:
+            return False
+        admit_id = request.request_id
+        holders = [
+            (rid, req)
+            for rid, req in self._mars_kv_holding_waiting()
+            if rid != admit_id
+        ]
+        if not holders:
             return False
         usage = self.kv_cache_manager.usage
-        # Build candidate list: resumed-PRESERVE, WAITING, not in-flight,
-        # not the request being admitted itself.
-        admit_id = request.request_id
-        candidates = [
-            (self._v2_score(req, 0, 0), rid, req)
-            for rid, req in self.mars_resumed_preserved.items()
-            if rid != admit_id
-            and req.status == RequestStatus.WAITING
-            and not self._mars_request_inflight(req)
-        ]
-        if not candidates:
-            return False
         # Evict the LOWEST priority (highest V2 score = least worth keeping).
+        candidates = [(self._v2_score(req, 0, 0), rid, req) for rid, req in holders]
         candidates.sort(key=lambda x: x[0], reverse=True)
         _, victim_rid, victim = candidates[0]
         mode, waste = self._demote_choice(victim_rid, victim)
@@ -762,7 +809,10 @@ class _MARSSchedulerMixin:
             mode.value,
             admit_id,
         )
-        return True
+        # Return False: defer this request to the next schedule() step with
+        # the freed memory available. Returning True (retry same step) causes a
+        # free→re-admit→re-hold churn cycle at high load.
+        return False
 
     def _demote_choice(self, rid: str, request: Request):
         """``(mode, waste)`` to demote a preserved-paused request, from classify().
@@ -781,15 +831,36 @@ class _MARSSchedulerMixin:
         return None, waste  # 'preserve' (or 'swap' w/o connector): stay pinned
 
     def _demote(self, rid, request, mode, waste, usage) -> None:
-        # Free the preserved-paused KV now; resume reloads (SWAP) or recomputes
-        # (RECOMPUTE) -- the same mechanism as a SWAP/RECOMPUTE pause.
-        self.kv_cache_manager.free(request)
+        # Free the preserved-paused or WFRKV KV now.
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            # Cancel the in-progress async KV load: tell the connector to drop
+            # its in-flight load state (cancels the PCIe copy, releases CPU pin),
+            # free the GPU blocks, reset num_computed_tokens=0, and transition back
+            # to plain WAITING so the request re-enters normal admission next step.
+            # The hardened _update_from_kv_xfer_finished (mars-port vLLM edit)
+            # safely ignores any stale completion that arrives after this.
+            if self.connector is not None and hasattr(
+                self.connector, "cancel_load_for_request"
+            ):
+                self.connector.cancel_load_for_request(request)
+            self.kv_cache_manager.free(request)
+            request.num_computed_tokens = 0
+            if hasattr(self, "finished_recving_kv_req_ids"):
+                self.finished_recving_kv_req_ids.discard(rid)
+            # Prevent re-entering WAITING_FOR_REMOTE_KVS on the very next
+            # admission: the CPU blocks are still in the connector's LRU cache
+            # and would be found immediately without this flag.  The flag is
+            # cleared by _update_request_as_session on the next API resume.
+            request.skip_reading_prefix_cache = True
+            # Transition back to WAITING so the request is schedulable next step.
+            request.status = RequestStatus.WAITING
+        else:
+            self.kv_cache_manager.free(request)
         st = self.mars_state.get(rid)
         if st is None:
             st = _MarsReqState(policy_letter=self._api_policy_for(request))
             self.mars_state[rid] = st
         st.pending_reset = True
-        self.mars_preserve_count -= 1
         if mode is PauseMode.SWAP:
             st.pending_skip_prefix = False
             self.mars_swap_count += 1
@@ -827,8 +898,9 @@ class _MARSSchedulerMixin:
             # recompute (prompt + kept output + injected API tokens).
             is_swap = not st.pending_skip_prefix  # SWAP=False/RECOMPUTE=True
             session.num_computed_tokens = 0
-            if st.pending_skip_prefix:
-                session.skip_reading_prefix_cache = True
+            # Explicitly set/clear skip_reading_prefix_cache so any value set
+            # by a prior WFRKV reclaim is always overridden at resume time.
+            session.skip_reading_prefix_cache = st.pending_skip_prefix
             if is_swap:
                 # The connector will serve KV from host asynchronously
                 # (WAITING_FOR_REMOTE_KVS overlap) when the request is next admitted.
