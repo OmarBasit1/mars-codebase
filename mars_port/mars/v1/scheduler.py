@@ -24,7 +24,6 @@ produce identical output tokens (verified by the Phase 3 smoke test).
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
@@ -41,7 +40,6 @@ from mars.policies import (
     degrade_swap,
 )
 from mars.v1.queue import _MarsHeapQueue, make_mars_queue
-from mars.v1.solver import GUROBI_AVAILABLE, MarsSolver, SolverParams, split_to_mode
 
 # Name under the "vllm" namespace so MARS logs inherit vLLM's log handler
 # (vLLM configures a handler on the "vllm" logger only, propagate=False).
@@ -135,33 +133,14 @@ class _MARSSchedulerMixin:
                 c=self.mars_config.cost_c,
                 max_ragged_batch=self.mars_config.cost_max_ragged_batch,
                 block_size=self._block_size,
+                # v1 async/write-through swap model: profiled reload latency
+                # (s/tok) + the forward coeffs. swap_a1/a2/c are no longer used.
+                per_token_swap_latency=self.mars_config.per_token_swap_latency,
                 swap_a1=self.mars_config.cost_swap_a1,
                 swap_a2=self.mars_config.cost_swap_a2,
                 swap_c=self.mars_config.cost_swap_c,
             )
         )
-        # Optional Gurobi solver for 'V' (decision-only): falls back to the
-        # greedy cost model when unavailable.
-        self.solver: MarsSolver | None = None
-        if self.mars_config.use_solver:
-            if GUROBI_AVAILABLE:
-                self.solver = MarsSolver(
-                    SolverParams(
-                        block_size=self._block_size,
-                        target=self.mars_config.solver_target,
-                        timeout=self.mars_config.solver_timeout,
-                        free_swap_tokens=self.mars_config.solver_free_swap_tokens,
-                        per_token_swap_latency=self.mars_config.solver_per_token_swap_latency,
-                        poly_a=self.mars_config.solver_poly_a,
-                        poly_b=self.mars_config.solver_poly_b,
-                        poly_c=self.mars_config.solver_poly_c,
-                    )
-                )
-            else:
-                logger.warning(
-                    "[MARS] use_solver set but gurobipy unavailable; "
-                    "falling back to the greedy cost model."
-                )
         # chunk-fill (simplified): cap the per-step token budget so paused
         # (preserved) KV plus new work fit. Full dynamic chunk-fill is Phase 6.
         if self.mars_config.chunk_fill and self.mars_config.chunk_size > 0:
@@ -327,42 +306,12 @@ class _MARSSchedulerMixin:
             running_blocks=running_blocks,
             swap_available=self._swap_available,
         )
-        # Optional decision-only solver (V only) overrides the greedy mode; the
-        # waste for ranking is still taken from the greedy cost model.
-        if self.solver is not None and letter == "V":
-            smode = self._solver_mode(request, mp, seq_blocks, running_batch, running_blocks)
-            if smode is not None and smode in wastes:
-                mode = smode
         st.arrival_strategy = _MODE_TO_STRATEGY[mode]
         st.arrival_waste = wastes[mode]
         logger.info(
             "[MARS] classify req=%s policy=%s -> strategy=%s waste=%.4g (predicted)",
             request.request_id, letter, st.arrival_strategy, st.arrival_waste,
         )
-
-    def _solver_mode(self, request, mp, num_blocks, running_batch, running_blocks):
-        """Decision-only Gurobi solve -> dominant whole-request mode (or None)."""
-        res = self.solver.solve_blocks(
-            num_tokens=request.num_tokens,
-            num_active_gpu_blocks=running_blocks,
-            api_exec_time=mp.predicted_api_exec_time,
-            api_return_length=mp.api_return_length,
-            arrival_time=request.arrival_time,
-            now=time.time(),
-            running_query_head=running_batch,
-            running_query_tail=running_batch,
-            swap_in_chunks_head=self.solver.free_swap,
-            swap_in_chunks_tail=self.solver.free_swap,
-        )
-        if res is None:
-            return None
-        c_s, c_d, n_e = res
-        mode, _ = split_to_mode(
-            c_s, c_d, n_e, num_blocks,
-            swap_available=self._swap_available,
-            swap_fallback=self.mars_config.swap_fallback,
-        )
-        return mode
 
     # --- pause hook --------------------------------------------------------
 
@@ -846,21 +795,12 @@ class _MARSSchedulerMixin:
     def _demote_choice(self, rid: str, request: Request):
         """``(mode, waste)`` to demote a preserved-paused request, from classify().
 
-        Routing by policy letter (faithful to the original's per-policy schedulers):
-          * ``I`` (InferCept) -> **recompute-only**, by construction. Demotes to
-            RECOMPUTE regardless of the classified strategy and never stays pinned
-            via 'preserve' (the costliest is still kept by the ``max_waste``
-            threshold in :meth:`_mars_demote_paused`). Enforced in code so an
-            ``I`` run with a swap connector configured can't drift to SWAP.
-          * ``V``/``G`` -> swap-aware: apply the arrival-classified strategy
-            (swap/recompute); a 'preserve'-classified request returns ``mode=None``
-            (never demoted, stays pinned), matching the original.
+        Applies the arrival-classified strategy (swap/recompute) for ``V`` and
+        direct policies. A 'preserve'-classified request returns ``mode=None``
+        (never demoted, stays pinned).
         """
         st = self.mars_state.get(rid)
         waste = st.arrival_waste if st is not None else 0.0
-        letter = st.policy_letter if st is not None else ""
-        if letter == "I":
-            return PauseMode.RECOMPUTE, waste
         strat = st.arrival_strategy if st is not None else "recompute"
         if strat == "swap" and self._swap_available:
             return PauseMode.SWAP, waste

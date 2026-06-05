@@ -33,15 +33,25 @@ class CostModelCoeffs:
         a: Per-token slope of the forward-step time (ms/token).
         c: Fixed per-step overhead (ms).
         max_ragged_batch: Tokens/step at which the forward becomes compute-bound
-            (the original ``384``).
+            (the original ``384``; read from vLLM ``max_num_batched_tokens``).
         block_size: KV block size (tokens per block).
+        per_token_swap_latency: Host<->GPU KV transfer latency (s/token), profiled
+            by ``calibrate_cost.py`` (``per_token_swap_latency``). Drives the
+            v1 async-overlap swap-waste model.
     """
 
     a: float = 0.0463
     c: float = 10.0
     max_ragged_batch: int = 384
     block_size: int = 16
-    # Swap-waste coefficients (Phase 6, 3-way).
+    # Async swap-in (host->GPU reload) latency, s/token. The v1 swap-waste model
+    # uses this + the forward coeffs only.
+    per_token_swap_latency: float = 4e-5
+    # DEPRECATED (unused): the original V0 *blocking*-swap coefficients. v1's
+    # CPU-offload connector is a write-through cache (swap-out is a sunk,
+    # policy-independent mirror) and the swap-in reload is async/overlapped, so
+    # the blocking model these parameterised no longer applies. Kept only so
+    # existing configs / calibrate output don't error on load.
     swap_a1: float = 0.136
     swap_a2: float = 0.181
     swap_c: float = 22.5
@@ -89,19 +99,39 @@ class CostModel:
     def swap_waste(
         self, num_blocks: int, running_batch: int, running_blocks: int
     ) -> float:
-        """w_s: memory-time wasted waiting for the host<->GPU KV transfer.
+        """w_s: memory-time of the v1 **async, write-through** swap (token-seconds).
 
-        Ported from the original ``swap_waste``; linear in the number of swap
-        iterations ``n``. Coefficients are transfer-path specific (re-profile
-        against the CPU-offload connector for real experiments).
+        The v1 CPU-offload connector is a write-through cache: every request's KV
+        is mirrored GPU->CPU as it is computed, so the swap-OUT is a sunk,
+        policy-independent cost (paid by preserve/recompute/swap alike). Choosing
+        SWAP for a request therefore only adds the **swap-IN reload**, which is
+        async and overlaps compute. So the original V0 blocking model (a per-iter
+        stall, swap-out+in contention ``x2``) does not apply; this models the
+        reload instead:
+
+            T       = per_token_swap_latency * req_tokens   # async reload time (s)
+            overlap = f_fwd * n                              # compute that hides it
+            exposed = max(T - overlap, 0)                    # un-hidden remainder
+            w_s     = T * req_tokens                         # own KV held during reload
+                    + exposed * running_blocks * bs          # only exposed part contends (x1)
+
+        where ``f_fwd = (a*max_ragged_batch + c)/1000`` is the forward time per
+        resume iteration and ``n`` the number of resume iterations. Uses only the
+        profiled ``per_token_swap_latency`` + the forward coeffs (the V0
+        ``swap_a1/a2/c`` are no longer used). When the reload hides fully
+        (``exposed == 0``, the common case) ``w_s`` reduces to
+        ``per_token_swap_latency * req_tokens^2`` -- small, so swap is the
+        cheapest free-the-memory option exactly where it wins in practice.
         """
         co = self.coeffs
         bs = co.block_size
+        req_tokens = bs * num_blocks
         c_h = max(co.max_ragged_batch - running_batch, 1)
-        n = max((bs * num_blocks + c_h - 1) // c_h - 1, 1)
-        f_ch = (co.swap_a1 * c_h) / 1000.0
-        f_s = (co.swap_a2 * co.max_ragged_batch + co.swap_c) / 1000.0
-        return f_s * n * bs * num_blocks + f_ch * n * running_blocks * bs * 2
+        n = max((req_tokens + c_h - 1) // c_h - 1, 1)
+        transfer_s = co.per_token_swap_latency * req_tokens
+        f_fwd = (co.a * co.max_ragged_batch + co.c) / 1000.0
+        exposed_s = max(transfer_s - f_fwd * n, 0.0)
+        return transfer_s * req_tokens + exposed_s * running_blocks * bs
 
     def choose_2way(
         self,
@@ -128,12 +158,10 @@ class CostModel:
         running_blocks: int,
         swap_available: bool,
     ) -> tuple[PauseMode, dict[PauseMode, float]]:
-        """Greedy 3-way (or 2-way) Vulcan: pick the minimum-waste mode.
+        """3-way (or 2-way) Vulcan: pick the minimum-waste mode.
 
         Returns ``(mode, wastes)`` where ``wastes`` maps each evaluated mode to
-        its waste (SWAP is included only when ``swap_available``). The full
-        partial-split optimisation (the original Gurobi solver) is a refinement
-        on top of this greedy choice.
+        its waste (SWAP is included only when ``swap_available``).
 
         Tie-breaking is **preserve > swap > recompute**, matching the original
         ``classify()``'s comparison order (``w_p <= both`` then ``w_s <= both``

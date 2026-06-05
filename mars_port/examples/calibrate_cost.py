@@ -1,13 +1,12 @@
-"""Calibrate every MARS cost-model / solver coefficient to a model + GPU.
+"""Calibrate MARS cost-model coefficients to a model + GPU.
 
-Measures the empirical cost of each KV operation so the cost model, the swap
-waste, and the Gurobi solver are grounded on the real hardware:
+Measures the empirical cost of each KV operation so the cost model and swap
+waste are grounded on the real hardware:
 
-  * RECOMPUTE / forward  -> prefill latency vs #tokens. Fit BOTH a linear model
-    (``cost_a``, ``cost_c`` for ``discard_waste``) and a quadratic model
-    (``solver_poly_a/b/c`` for the solver's batch polynomial).
-  * SWAP  -> host<->GPU round-trip latency for KV-block-sized tensors -> the
-    per-token swap latency (``solver_per_token_swap_latency``, ``cost_swap_a1``).
+  * RECOMPUTE / forward  -> prefill latency vs #tokens, fit to a linear model
+    (``cost_a``, ``cost_c`` for ``discard_waste``).
+  * SWAP  -> host<->GPU round-trip latency for KV-block-sized tensors ->
+    per-token swap latency (``per_token_swap_latency``, ``cost_swap_a1``).
   * PRESERVE -> ~0 (no operation; the baseline).
 
 Prints a ready-to-paste ``MarsConfig(...)`` block. Works with
@@ -108,20 +107,15 @@ def main() -> None:
     for n, l in zip(lengths, lat):
         print(f"  N={n:>5}  {l:8.3f} ms  ({l / n:.4f} ms/tok)")
     a1, c1 = np.linalg.lstsq(np.vstack([lengths, np.ones(len(lengths))]).T, lat, rcond=None)[0]
-    qa, qb, qc = np.polyfit(lengths, lat, 2)
-    print(f"  linear:    cost_a={a1:.6f}  cost_c={c1:.3f}")
-    print(f"  quadratic: solver_poly_a={qa:.3e}  solver_poly_b={qb:.4f}  solver_poly_c={qc:.3f}")
+    print(f"  cost_a={a1:.6f}  cost_c={c1:.3f}")
 
     print("\n# === paste into MarsConfig (or additional_config) ===")
     print(f"MarsConfig(")
     print(f"    cost_a={a1:.6f}, cost_c={c1:.3f},")
-    # cost_swap_a1 feeds swap_waste's f_ch=(swap_a1*c_h)/1000 term, whose /1000 is
-    # the same ms->s conversion as discard_waste's cost_a -- so it must be in
-    # ms/token (NOT us/token). Emitting per_tok_swap_ms*1000 (us/tok) inflated it
-    # 1000x and made the cost model never pick swap. Keep it in ms/tok, like cost_a.
+    # cost_swap_a1 feeds swap_waste's f_ch=(swap_a1*c_h)/1000 term -- must be in
+    # ms/token (same unit as cost_a), NOT us/token.
     print(f"    cost_swap_a1={per_tok_swap_ms:.6f},  # ms/tok")
-    print(f"    solver_per_token_swap_latency={per_tok_swap_ms / 1000:.3e},  # s/tok")
-    print(f"    solver_poly_a={qa:.3e}, solver_poly_b={qb:.4f}, solver_poly_c={qc:.3f},")
+    print(f"    per_token_swap_latency={per_tok_swap_ms / 1000:.3e},  # s/tok")
     print(f")")
     print(">>> CALIBRATE_DONE")
 

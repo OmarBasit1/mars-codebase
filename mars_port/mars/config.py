@@ -23,10 +23,7 @@ _GENERIC_COST_DEFAULTS: dict[str, float] = {
     "cost_a": 0.0463,
     "cost_c": 10.0,
     "cost_swap_a1": 0.136,
-    "solver_per_token_swap_latency": 4e-5,
-    "solver_poly_a": 1.3e-5,
-    "solver_poly_b": 0.328,
-    "solver_poly_c": 24.1,
+    "per_token_swap_latency": 4e-5,
 }
 
 # Per-GPU calibrated overrides.  Matched as substrings of torch device name.
@@ -35,10 +32,7 @@ _GPU_PROFILES: dict[str, dict[str, float]] = {
             "cost_a": 0.002395,
             "cost_c": 55.122,
             "cost_swap_a1": 0.084919,  # ms/tok (was 84.9189 us/tok -- 1000x unit bug)
-            "solver_per_token_swap_latency": 8.492e-05,  # s/tok
-            "solver_poly_a": 1.224e-8,
-            "solver_poly_b": 0.0022,
-            "solver_poly_c": 55.236,
+            "per_token_swap_latency": 8.492e-05,  # s/tok
         },
 }
 
@@ -95,23 +89,25 @@ class MarsConfig:
     # (the forward-step time model is ~ (cost_a * batch_tokens + cost_c) ms, and
     # cost_max_ragged_batch is the tokens/step where compute saturates).
     # None => auto-filled by __post_init__ from the detected GPU profile (cost_a/c/
-    # swap_a1/etc.) or from vllm's scheduler_config.max_num_batched_tokens
+    # per_token_swap_latency/etc.) or from vllm's scheduler_config.max_num_batched_tokens
     # (cost_max_ragged_batch) at scheduler init time.
     cost_a: float | None = None
     cost_c: float | None = None
     cost_max_ragged_batch: int | None = None
-    # Swap-waste coefficients (Phase 6, 3-way Vulcan). Original MARS values;
+    # Swap-waste coefficients (3-way Vulcan). Original MARS values;
     # re-profile against the CPU-offload transfer path for real experiments.
     cost_swap_a1: float | None = None
     cost_swap_a2: float = 0.181
     cost_swap_c: float = 22.5
-    # Dynamic memory-pressure demotion (Greedy / InferCept, and V). Enabled by
-    # default. Faithful to the original _schedule_chunk_and_fill: every step,
-    # keep only the single highest-waste preserved-paused request pinned and
-    # demote the rest (free their KV -> swap / recompute) so the freed memory can
-    # admit waiting work. Pure 'P' is never demoted. Gated only on pending
-    # admission demand (requests waiting). Set False to ablate demotion entirely
-    # (preserved-paused KV is then only reclaimed by the running==0 safety net).
+    # Host<->GPU KV transfer latency (s/token), profiled by calibrate_cost.py.
+    # Drives the v1 async-overlap swap-waste model.
+    per_token_swap_latency: float | None = None
+    # Dynamic memory-pressure demotion (V policy). Enabled by default.
+    # Every step, keep only the single highest-waste preserved-paused request
+    # pinned and demote the rest (free their KV -> swap / recompute) so the freed
+    # memory can admit waiting work. Pure 'P' is never demoted. Gated only on
+    # pending admission demand (requests waiting). Set False to ablate demotion
+    # entirely (preserved-paused KV is then only reclaimed by the running==0 safety net).
     demote_paused: bool = True
     # Optional KV-usage floor for demotion. 0 (default) => faithful original:
     # demote whenever work is waiting, regardless of usage. >0 => only demote
@@ -132,19 +128,6 @@ class MarsConfig:
     preload_headroom: float = 0.6
     # Max preloads to START per schedule step (spreads PCIe traffic).
     preload_per_step: int = 2
-    # Gurobi solver (decision-only) for the 'V' policy: per pause, solve the
-    # optimal KV split and apply the dominant WHOLE-request mode. Coefficients
-    # are re-calibrated via examples/calibrate_cost.py (6B reference values from
-    # the original 6B_bench.sh in comments). See COMPARISON.md for the
-    # partial-split -> whole-request discrepancy.
-    use_solver: bool = False
-    solver_target: float = 1500.0  # SLA target throughput (tokens/s)
-    solver_per_token_swap_latency: float | None = None
-    solver_poly_a: float | None = None  # forward time = (a*x^2 + b*x + c)/1000 ms
-    solver_poly_b: float | None = None
-    solver_poly_c: float | None = None
-    solver_free_swap_tokens: int = 976
-    solver_timeout: float = 0.025  # Gurobi TimeLimit (s)
     # Path to a JSONL sidecar file where the scheduler writes one record per
     # finished request (policy, arrival_strategy, swap_reloads).  Empty = disabled.
     # Set by the bench harness so it can enrich the per-request CSV.
