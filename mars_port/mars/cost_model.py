@@ -134,16 +134,26 @@ class CostModel:
         its waste (SWAP is included only when ``swap_available``). The full
         partial-split optimisation (the original Gurobi solver) is a refinement
         on top of this greedy choice.
+
+        Tie-breaking is **preserve > swap > recompute**, matching the original
+        ``classify()``'s comparison order (``w_p <= both`` then ``w_s <= both``
+        else recompute) -- so a ``w_s == w_d < w_p`` tie resolves to SWAP, not
+        RECOMPUTE (a plain ``min`` over the dict would pick RECOMPUTE).
         """
+        w_p = self.preserve_waste(api_exec_time, before_api_tokens)
+        w_d = self.discard_waste(num_blocks, running_batch, running_blocks)
         wastes: dict[PauseMode, float] = {
-            PauseMode.PRESERVE: self.preserve_waste(api_exec_time, before_api_tokens),
-            PauseMode.RECOMPUTE: self.discard_waste(
-                num_blocks, running_batch, running_blocks
-            ),
+            PauseMode.PRESERVE: w_p,
+            PauseMode.RECOMPUTE: w_d,
         }
+        w_s = float("inf")
         if swap_available:
-            wastes[PauseMode.SWAP] = self.swap_waste(
-                num_blocks, running_batch, running_blocks
-            )
-        mode = min(wastes, key=lambda m: wastes[m])
+            w_s = self.swap_waste(num_blocks, running_batch, running_blocks)
+            wastes[PauseMode.SWAP] = w_s
+        if w_p <= w_d and w_p <= w_s:
+            mode = PauseMode.PRESERVE
+        elif w_s <= w_p and w_s <= w_d:
+            mode = PauseMode.SWAP
+        else:
+            mode = PauseMode.RECOMPUTE
         return mode, wastes

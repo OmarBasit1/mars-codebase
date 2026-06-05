@@ -115,7 +115,11 @@ def main() -> None:
     print("\n# === paste into MarsConfig (or additional_config) ===")
     print(f"MarsConfig(")
     print(f"    cost_a={a1:.6f}, cost_c={c1:.3f},")
-    print(f"    cost_swap_a1={per_tok_swap_ms * 1000:.4f},  # us/tok")
+    # cost_swap_a1 feeds swap_waste's f_ch=(swap_a1*c_h)/1000 term, whose /1000 is
+    # the same ms->s conversion as discard_waste's cost_a -- so it must be in
+    # ms/token (NOT us/token). Emitting per_tok_swap_ms*1000 (us/tok) inflated it
+    # 1000x and made the cost model never pick swap. Keep it in ms/tok, like cost_a.
+    print(f"    cost_swap_a1={per_tok_swap_ms:.6f},  # ms/tok")
     print(f"    solver_per_token_swap_latency={per_tok_swap_ms / 1000:.3e},  # s/tok")
     print(f"    solver_poly_a={qa:.3e}, solver_poly_b={qb:.4f}, solver_poly_c={qc:.3f},")
     print(f")")

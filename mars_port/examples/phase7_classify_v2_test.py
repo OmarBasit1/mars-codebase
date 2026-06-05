@@ -22,7 +22,7 @@ from mars.v1.scheduler import _MARSSchedulerMixin, _MarsReqState
 
 _BOUND = (
     "_api_policy_for", "_running_contention", "_mars_classify",
-    "_v2_score", "_mem_time",
+    "_classify_strategy", "_v2_score", "_mem_time",
 )
 
 

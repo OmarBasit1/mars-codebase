@@ -34,7 +34,7 @@ _GPU_PROFILES: dict[str, dict[str, float]] = {
     "A40": {
             "cost_a": 0.002395,
             "cost_c": 55.122,
-            "cost_swap_a1": 84.9189,
+            "cost_swap_a1": 0.084919,  # ms/tok (was 84.9189 us/tok -- 1000x unit bug)
             "solver_per_token_swap_latency": 8.492e-05,  # s/tok
             "solver_poly_a": 1.224e-8,
             "solver_poly_b": 0.0022,
@@ -105,18 +105,33 @@ class MarsConfig:
     cost_swap_a1: float | None = None
     cost_swap_a2: float = 0.181
     cost_swap_c: float = 22.5
-    # Dynamic demotion (Greedy / InferCept, and V). Faithful to the original
-    # _schedule_chunk_and_fill: every step, keep only the single highest-waste
-    # preserved-paused request pinned and demote the rest (free their KV -> swap
-    # / recompute) so the freed memory can admit waiting work. Demoting each
-    # request right after it pauses spreads the CPU-offload (PCIe) traffic across
-    # the workload instead of bursting it at a memory wall. Pure 'P' is never
-    # demoted. Gated only on pending admission demand (requests waiting).
-    demote_under_pressure: bool = True
+    # Dynamic memory-pressure demotion (Greedy / InferCept, and V). Enabled by
+    # default. Faithful to the original _schedule_chunk_and_fill: every step,
+    # keep only the single highest-waste preserved-paused request pinned and
+    # demote the rest (free their KV -> swap / recompute) so the freed memory can
+    # admit waiting work. Pure 'P' is never demoted. Gated only on pending
+    # admission demand (requests waiting). Set False to ablate demotion entirely
+    # (preserved-paused KV is then only reclaimed by the running==0 safety net).
+    demote_paused: bool = True
     # Optional KV-usage floor for demotion. 0 (default) => faithful original:
     # demote whenever work is waiting, regardless of usage. >0 => only demote
     # once usage exceeds this fraction (re-enables the old pressure gate).
     demote_pressure_threshold: float = 0.0
+    # Proactive mid-API-wait swap reload (COMPARISON #2). When on, a SWAP-demoted
+    # request whose KV is on host has its host->GPU reload STARTED while it is
+    # still parked for the API (if GPU memory is spare), so the KV is resident by
+    # the time the API returns -- instead of the default admission-gated reload
+    # that starts only after resume. Default OFF: the measured post-resume reload
+    # latency is ~1% of e2e (the async WFRKV path already overlaps it), so this is
+    # opt-in. Only meaningful with a CPU-offload connector (--swap). Gated on spare
+    # GPU memory (preload re-occupies the memory swap freed, so it self-limits and
+    # a re-demote reclaims it under pressure). See preload_headroom.
+    proactive_preload: bool = False
+    # Only preload when KV usage is below this fraction (spare GPU memory). Above
+    # it, leave demoted-SWAP requests on host (preloading would defeat the swap).
+    preload_headroom: float = 0.6
+    # Max preloads to START per schedule step (spreads PCIe traffic).
+    preload_per_step: int = 2
     # Gurobi solver (decision-only) for the 'V' policy: per pause, solve the
     # optimal KV split and apply the dominant WHOLE-request mode. Coefficients
     # are re-calibrated via examples/calibrate_cost.py (6B reference values from

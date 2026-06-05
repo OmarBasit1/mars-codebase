@@ -39,7 +39,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from mars.config import MarsConfig
-from mars.orchestrator import ApiOrchestrator, ApiSegment
+from mars.orchestrator import ApiOrchestrator, ApiSegment, OrchestratorResult
 from mars.params import MarsApiParams
 from mars.swap import cpu_offload_kv_transfer_config
 
@@ -114,6 +114,7 @@ async def main_async(args: argparse.Namespace) -> None:
         seed=args.seed,  # deterministic engine sampling => repeatable per (qps, seed)
         gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
         load_format=args.load_format,
         disable_hybrid_kv_cache_manager=True,
         async_scheduling=not args.sync_scheduling,
@@ -123,6 +124,8 @@ async def main_async(args: argparse.Namespace) -> None:
             policy_config=args.policy_config,
             chunk_fill=args.chunk_fill,
             chunk_size=args.chunk_size,
+            demote_paused=not args.no_demote,
+            proactive_preload=args.proactive_preload,
             starvation_avoidance=args.starvation_avoidance,
             starvation_threshold=args.starvation_threshold,
             starvation_quantum=args.starvation_quantum,
@@ -169,12 +172,20 @@ async def main_async(args: argparse.Namespace) -> None:
             await asyncio.sleep(wait)
         arrivals[str(i)] = time.perf_counter()
         orch = ApiOrchestrator(engine, api_result_token=args.api_token)
-        return await orch.run_request(
-            request_id=str(i),
-            prompt_token_ids=plan.prompt_token_ids,
-            segments=plan.segments,
-            extra_args=plan.mars.to_extra_args(),
-        )
+        try:
+            return await asyncio.wait_for(
+                orch.run_request(
+                    request_id=str(i),
+                    prompt_token_ids=plan.prompt_token_ids,
+                    segments=plan.segments,
+                    extra_args=plan.mars.to_extra_args(),
+                ),
+                timeout=float(args.window) * 2,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return OrchestratorResult(
+                request_id=str(i), finished=False, end_time=time.perf_counter()
+            )
 
     results = await asyncio.gather(*(drive(i, p) for i, p in enumerate(plans)))
     wall = time.perf_counter() - t0
@@ -230,11 +241,12 @@ async def main_async(args: argparse.Namespace) -> None:
                      mars_rec.get("policy", ""),
                      mars_rec.get("arrival_strategy", ""),
                      mars_rec.get("swap_reloads", ""),
+                     mars_rec.get("demotions", ""),
                      f"{pr_ttft_mean:.4f}" if not np.isnan(pr_ttft_mean) else ""])
 
     print("=" * 56)
     print(f"policy={args.api_policy} policy_config={args.policy_config} "
-          f"swap={args.swap} chunk_fill={args.chunk_fill}")
+          f"swap={args.swap} chunk_fill={args.chunk_fill} demote={not args.no_demote}")
     print(f"requests: {len(results)}  finished: {len(finished)}  wall: {wall:.2f}s")
     print(f"output tokens: {total_gen}  throughput: {total_gen / wall:.1f} tok/s, "
           f"{len(finished) / wall:.3f} req/s")
@@ -250,7 +262,7 @@ async def main_async(args: argparse.Namespace) -> None:
             w.writerow(["request_id", "finished", "pauses", "gen_tokens",
                         "api_wait_s", "e2e_s", "ttft_s", "norm_lat_s_per_tok",
                         "kv_policy", "arrival_strategy", "swap_reloads",
-                        "post_resume_ttft_s"])
+                        "demotions", "post_resume_ttft_s"])
             w.writerows(rows)
         print(f"wrote per-request CSV -> {args.csv}")
 
@@ -267,6 +279,11 @@ def main() -> None:
     ap.add_argument("--policy-config", default="fcfs")
     ap.add_argument("--chunk-fill", action="store_true")
     ap.add_argument("--chunk-size", type=int, default=0)
+    ap.add_argument("--no-demote", action="store_true",
+                    help="disable dynamic memory-pressure demotion (on by default)")
+    ap.add_argument("--proactive-preload", action="store_true",
+                    help="start SWAP-demoted requests' host->GPU reload mid-API-wait "
+                         "(needs --swap; off by default)")
     ap.add_argument("--starvation-avoidance", action="store_true")
     ap.add_argument("--starvation-threshold", type=int, default=100)
     ap.add_argument("--starvation-quantum", type=int, default=100000)
@@ -277,6 +294,8 @@ def main() -> None:
     ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--load-format", default="auto", help="e.g. 'dummy' for no download")
     ap.add_argument("--max-model-len", type=int, default=2048)
+    ap.add_argument("--max-num-seqs", type=int, default=256,
+                    help="max concurrent sequences (vLLM default auto-sizes to ~128)")
     ap.add_argument("--gpu-mem", type=float, default=0.4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--api-token", type=int, default=5000)
