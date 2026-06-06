@@ -1,4 +1,4 @@
-"""Phase 2 smoke test: native pause / API-inject / resume, single request.
+"""Orchestrator end-to-end: pause / API-inject / resume correctness.
 
 Drives the SAME request twice, differing ONLY in the injected "API result"
 tokens, and asserts:
@@ -10,10 +10,8 @@ tokens, and asserts:
     proving the injected API tokens are fed in at the right position and
     actually condition the resumed generation.
 
-Run (from a neutral cwd so the installed vLLM isn't shadowed):
-    cd /tmp && CUDA_VISIBLE_DEVICES=0 \
-        /export2/obasit/MARS_derivative/vllm/.venv/bin/python \
-        /export2/obasit/MARS_derivative/mars-codebase/mars_port/examples/phase2_smoke.py
+Run from a neutral cwd:
+    cd /tmp && CUDA_VISIBLE_DEVICES=0 .venv/bin/python examples/test_orchestrator.py
 """
 
 import asyncio
@@ -77,7 +75,7 @@ async def main() -> None:
     assert rA.segment_tokens[1] != rB.segment_tokens[1], (
         "seg1 identical => injected API tokens did NOT condition the resume"
     )
-    print(">>> PHASE2_PAUSE_RESUME_OK")
+    print(">>> ORCHESTRATOR_E2E_OK")
     engine.shutdown()
 
 

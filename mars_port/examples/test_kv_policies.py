@@ -1,4 +1,4 @@
-"""Phase 3 smoke test: per-pause KV policy — Preserve vs Recompute.
+"""KV policy end-to-end: Preserve vs Recompute produce byte-identical output.
 
 Runs the SAME 2-pause request under api_policy='P' (Preserve) and 'D'
 (Recompute) on one engine and asserts:
@@ -7,11 +7,12 @@ Runs the SAME 2-pause request under api_policy='P' (Preserve) and 'D'
     performance/memory choice, NOT a correctness change (Recompute must
     reproduce exactly what Preserve produced from the cached KV);
   * the scheduler counted 2 preserve-pauses for 'P' and 2 recompute-frees for
-    'D' (mechanism actually differed) — surfaced via the '[MARS] pause ...'
-    log lines, which the bash wrapper greps.
+    'D' (mechanism actually differed) — surfaced via the '[MARS] pause ...' logs.
 
-Prefix caching is disabled so the two requests don't share cached KV, making
-the Preserve-vs-Recompute behavior unambiguous.
+Prefix caching is disabled so the two requests don't share cached KV.
+
+Run from a neutral cwd:
+    cd /tmp && CUDA_VISIBLE_DEVICES=0 .venv/bin/python examples/test_kv_policies.py
 """
 
 import asyncio
@@ -75,7 +76,7 @@ async def main() -> None:
     assert rP.pauses == N_PAUSES and rD.pauses == N_PAUSES, "wrong pause count"
     assert rP.total_generated == rD.total_generated == GEN * 3, "wrong token count"
     assert fP == fD, f"Preserve vs Recompute changed the output ({n_diff} tokens differ)!"
-    print(">>> PHASE3_PRESERVE_RECOMPUTE_OK")
+    print(">>> KV_POLICIES_E2E_OK")
     engine.shutdown()
 
 

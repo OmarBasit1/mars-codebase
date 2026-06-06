@@ -1,12 +1,14 @@
-"""Phase 6 end-to-end: SWAP via the native CPU-offload connector.
+"""Swap end-to-end: Preserve/Swap/Recompute produce byte-identical output with CPU offload.
 
 Builds an engine with vLLM's SimpleCPUOffloadConnector + prefix caching (so
 MARSScheduler enables SWAP), then runs the SAME 2-pause request under Preserve,
 Swap, and Recompute and asserts they all produce BYTE-IDENTICAL output -- i.e.
 swap correctly reloads the KV from the cache/host on resume, and recompute
-correctly rebuilds it; the policy is purely a memory/perf choice. The bash
-wrapper greps the '[MARS]' logs to confirm swap_available=True and the three
-distinct mechanisms (preserve / swap / recompute).
+correctly rebuilds it; the policy is purely a memory/perf choice. Grep
+'[MARS]' logs to confirm swap_available=True and the three distinct mechanisms.
+
+Run from a neutral cwd:
+    cd /tmp && CUDA_VISIBLE_DEVICES=0 .venv/bin/python examples/test_swap.py
 """
 
 import asyncio
@@ -72,7 +74,7 @@ async def main() -> None:
     assert rP.finished and rS.finished and rD.finished, "request did not finish"
     assert all(r.pauses == N_PAUSES for r in (rP, rS, rD)), "wrong pause count"
     assert fP == fS == fD, "preserve / swap / recompute produced different output!"
-    print(">>> PHASE6_SWAP_E2E_OK")
+    print(">>> SWAP_E2E_OK")
     engine.shutdown()
 
 

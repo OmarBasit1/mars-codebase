@@ -1,4 +1,4 @@
-"""Phase 4 unit test: 2-way Vulcan cost model + crossover (no GPU).
+"""Unit test: 2-way cost model preserve/recompute crossover (no GPU).
 
 For a paused request competing with a running batch, sweeping the API execution
 time must give: short API -> PRESERVE (holding KV is cheap), long API ->
@@ -39,7 +39,7 @@ def main() -> None:
     # Crossover should fall strictly inside the swept range.
     assert any(m is PauseMode.PRESERVE for m in modes)
     assert any(m is PauseMode.RECOMPUTE for m in modes)
-    print(">>> PHASE4_COST_MODEL_OK")
+    print(">>> COST_MODEL_2WAY_OK")
 
 
 if __name__ == "__main__":

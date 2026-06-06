@@ -1,11 +1,13 @@
-"""Dynamic memory-pressure demotion (Greedy / InferCept).
+"""Demotion end-to-end: dynamic KV eviction under memory pressure.
 
-Forces a tiny KV cache (num_gpu_blocks_override) and launches many requests
-concurrently under api_policy='G'. They pause (PRESERVE) and pile up, pinning
-KV, until usage crosses the threshold with requests still waiting -> the
-scheduler demotes the cheaper preserved-paused requests (frees their KV ->
-recompute) so the waiting work can run. Asserts every request still finishes;
-the bash wrapper greps the '[MARS] demote' logs to confirm demotion fired.
+Forces a tiny KV cache (num_gpu_blocks_override) and launches many concurrent
+requests under api_policy='V'. They pause (PRESERVE) and pile up, pinning KV,
+until requests are waiting and the scheduler demotes the cheaper preserved-paused
+requests (frees their KV -> recompute/swap) so waiting work can run. Asserts
+every request still finishes. Grep '[MARS] demote' logs to confirm demotion fired.
+
+Run from a neutral cwd:
+    cd /tmp && CUDA_VISIBLE_DEVICES=0 .venv/bin/python examples/test_demotion.py
 """
 
 import asyncio
@@ -55,19 +57,19 @@ async def main() -> None:
             enable_prefix_caching=False,
             scheduler_cls="mars.v1.scheduler.MARSScheduler",
             additional_config=MarsConfig(
-                api_policy="G", demote_pressure_threshold=0.5
+                api_policy="V", demote_pressure_threshold=0.5
             ).to_additional_config(),
         )
     )
     results = await asyncio.wait_for(
-        asyncio.gather(*(run(engine, f"g{i}", "G") for i in range(N))), timeout=240
+        asyncio.gather(*(run(engine, f"r{i}", "V") for i in range(N))), timeout=240
     )
     n_fin = sum(r.finished for r in results)
     total = sum(r.total_generated for r in results)
     print(f"requests: {N}  finished: {n_fin}  total_gen: {total}")
     assert n_fin == N, f"only {n_fin}/{N} finished (possible demotion deadlock)"
     assert all(r.total_generated == GEN * 2 for r in results), "wrong token counts"
-    print(">>> PHASE6B_DEMOTION_E2E_OK")
+    print(">>> DEMOTION_E2E_OK")
     engine.shutdown()
 
 

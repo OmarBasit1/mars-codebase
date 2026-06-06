@@ -1,4 +1,4 @@
-"""No-GPU unit test: arrival-time classify() + live-running_batch V2 ordering.
+"""Unit test: arrival-time classify() and live-running_batch V2 ordering (no GPU).
 
 Binds the MARS scheduler-mixin methods to a tiny fake scheduler (no engine) to
 check, without a GPU:
@@ -6,7 +6,7 @@ check, without a GPU:
     (a zero-API-wait request -> preserve; a huge-API-wait request -> not
     preserve);
   * the V2 score re-keyed with a live ``running_batch`` reorders the queue
-    (compute-heavy vs API-heavy requests swap rank as load rises) -- the
+    (compute-heavy vs API-heavy requests swap rank as load rises) — the
     faithful per-step re-rank the static ``running_batch=0`` key could not do.
 """
 
@@ -97,4 +97,4 @@ def test_v2_rekey() -> None:
 if __name__ == "__main__":
     test_classify()
     test_v2_rekey()
-    print(">>> PHASE7_CLASSIFY_V2_OK")
+    print(">>> CLASSIFY_V2_OK")

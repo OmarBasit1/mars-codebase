@@ -12,7 +12,7 @@ MARS = pause LLM generation at a predetermined token boundary → call an extern
 MARS_derivative/
 ├── vllm/                        # vLLM v1 repo (branch: mars-port)
 │   └── .venv/                   # Python 3.12 venv (uv-managed, installed editable)
-├── LMCache/                     # LMCache repo (branch: mars-port, Phase 6 swap)
+├── LMCache/                     # LMCache repo (branch: mars-port, swap connector)
 └── mars-codebase/               # MARS research repo (branch: mars-v1-port)
     ├── mars_port/               # *** THE PORT — all new code lives here ***
     │   ├── mars/                # Extension package (pip-installed editable)
@@ -33,9 +33,20 @@ MARS_derivative/
     │   │   └── entrypoints/
     │   │       └── api_server.py   # Thin API server skeleton
     │   ├── examples/
-    │   │   ├── calibrate_cost.py   # GPU/model profiling → paste-ready MarsConfig
-    │   │   ├── run_experiments.sh  # Full policy sweep (ports 6B_bench.sh)
-    │   │   └── phase*_smoke.py     # Per-phase validation scripts
+    │   │   ├── calibrate_cost.py      # GPU/model profiling → paste-ready MarsConfig
+    │   │   ├── run_experiments.sh     # Full policy sweep (ports 6B_bench.sh)
+    │   │   ├── test_orchestrator.py   # E2E: pause/inject/resume correctness
+    │   │   ├── test_kv_policies.py    # E2E: P vs D byte-identical output
+    │   │   ├── test_vulcan_classify.py# E2E: V strategy assigned at arrival
+    │   │   ├── test_swap.py           # E2E: P/S/D byte-identical with CPU offload
+    │   │   ├── test_demotion.py       # E2E: KV demotion under memory pressure
+    │   │   ├── test_proactive_preload.py # E2E: proactive preload byte-identical guard
+    │   │   ├── test_cost_model_2way.py   # Unit: preserve/recompute crossover (no GPU)
+    │   │   ├── test_cost_model_3way.py   # Unit: 3-way cost model with swap (no GPU)
+    │   │   ├── test_classify_v2.py       # Unit: classify at arrival + V2 ordering (no GPU)
+    │   │   ├── test_queue_sjf.py         # Unit: SJF queue ordering (no GPU)
+    │   │   ├── test_queue_combined.py    # Unit: combined V2/SJF across both queues (no GPU)
+    │   │   └── test_queue_starvation.py  # Unit: starvation front-boost + ordering (no GPU)
     │   └── COMPARISON.md           # Algorithm-level original-vs-port diff
     ├── diverse_oneapi_merged_exp_uniform.json  # Standard workload file
     ├── benchmarks/fixed_final_tput_bench_real.py  # Original vLLM 0.2.0 benchmark
@@ -149,6 +160,29 @@ _GPU_PROFILES: dict[str, dict[str, float]] = {
 ```
 
 The detected profile is merged over `_GENERIC_COST_DEFAULTS` in `MarsConfig.__post_init__`, so only fields that differ from the generic defaults need to be specified.
+
+---
+
+## Validation scripts (`examples/test_*.py`)
+
+Six end-to-end tests require a GPU; six unit tests require only the `mars` package (no GPU).
+
+| Script | GPU? | What it checks |
+|--------|------|----------------|
+| `test_orchestrator.py` | yes | Pause/inject/resume: injected tokens condition subsequent generation |
+| `test_kv_policies.py` | yes | P and D produce byte-identical output (policy is a perf/memory choice) |
+| `test_vulcan_classify.py` | yes | V assigns strategy at arrival from predicted API time, not at pause |
+| `test_swap.py` | yes | P, S, D produce byte-identical output with the CPU-offload connector |
+| `test_demotion.py` | yes | Dynamic KV demotion fires under memory pressure; all requests finish |
+| `test_proactive_preload.py` | yes | Proactive preload ON/OFF produces byte-identical output |
+| `test_cost_model_2way.py` | no | Preserve/recompute crossover is monotonic; `w_d` is API-time-independent |
+| `test_cost_model_3way.py` | no | 3-way `choose` selects SWAP only when available and cheapest |
+| `test_classify_v2.py` | no | Arrival classify picks correct strategy; V2 reorders queue with live batch |
+| `test_queue_sjf.py` | no | SJF queue pops shortest-remain-length first |
+| `test_queue_combined.py` | no | Combined V2/SJF ordering picks the smaller-key head across both queues |
+| `test_queue_starvation.py` | no | Starving requests sort to front; starvation boost expires after quantum |
+
+Run GPU tests from a neutral cwd (e.g. `/tmp`) to avoid import shadowing.
 
 ---
 

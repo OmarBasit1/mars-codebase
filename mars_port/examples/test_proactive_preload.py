@@ -1,16 +1,16 @@
-"""Part B safety test: proactive mid-API-wait swap preload (COMPARISON #2).
+"""Proactive preload correctness: preload ON/OFF produces byte-identical output.
 
 Runs the SAME staggered SWAP workload with proactive preload OFF and ON (separate
 engines, fixed seed) and asserts every request's output is BYTE-IDENTICAL between
-the two -- i.e. enabling the preload never changes tokens (correctness guard for
-the feature; it is opt-in via --proactive-preload, default off).
+the two. The feature is opt-in (--proactive-preload, default off).
 
-NOTE on firing: in practice the preload rarely has anything to do. With v1's
-CPU-offload connector + prefix caching, swap-freed KV stays in the GPU prefix
-cache and is re-served locally (get_num_new_matched_tokens -> is_async=False);
-the host-resident reload path the preload accelerates only engages once those
-blocks are actually evicted under sustained pressure -- a narrow transient. So
-this test's job is the byte-identical guard, not to force a preload to fire.
+NOTE: in practice the preload rarely fires. With v1's CPU-offload connector +
+prefix caching, swap-freed KV stays in the GPU prefix cache and is re-served
+locally (is_async=False); the host-resident path only engages after actual
+eviction under sustained pressure. This test's job is the byte-identical guard.
+
+Run from a neutral cwd:
+    cd /tmp && CUDA_VISIBLE_DEVICES=0 .venv/bin/python examples/test_proactive_preload.py
 """
 
 import asyncio
@@ -85,7 +85,7 @@ async def main() -> None:
     print(f"requests={len(out_off)}  byte-identical off-vs-on: {ndiff == 0} (differing={ndiff})")
     assert set(out_off) == set(out_on), "request id mismatch"
     assert ndiff == 0, "proactive preload changed the output vs the baseline!"
-    print(">>> PHASEB_PRELOAD_E2E_OK")
+    print(">>> PROACTIVE_PRELOAD_E2E_OK")
 
 
 if __name__ == "__main__":

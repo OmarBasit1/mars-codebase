@@ -4,8 +4,8 @@ set -euo pipefail
 PY=${PY:-/export2/obasit/MARS_derivative/vllm/.venv/bin/python}
 WL=${WL:-/export2/obasit/MARS_derivative/mars-codebase/diverse_oneapi_merged_exp_uniform.json}
 MODEL=${MODEL:-Qwen/Qwen2.5-14B-Instruct}
-WINDOW=${WINDOW:-300}
-QPS_LIST=${QPS_LIST:-"5 6 7"}    # qps=9 exceeds A40 capacity for MARS (cuBLAS OOM at kv_usage≈1.0)
+WINDOW=${WINDOW:-150}
+QPS_LIST=${QPS_LIST:-"3 5 7 9 11 13"}    # qps=9 exceeds A40 capacity for MARS (cuBLAS OOM at kv_usage≈1.0)
 OUT=${OUT:-./results/single_api_a40_qwen2.5_14b}
 GPU=${GPU:-0}
 CPU_GB=${CPU_GB:-32}
@@ -54,12 +54,22 @@ for q in $QPS_LIST; do
   # MARS ablation: full MARS but demotion disabled (isolate the demotion effect).
   run MARS_no_demote_sync "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
       --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling --no-demote
-  # Vanilla vLLM baseline: discard (recompute) + FCFS.
-  run Discard_sync "$q" --api-policy D --policy-config fcfs --sync-scheduling
-  # Always preserve
-  run Preserve_sync "$q" --api-policy P --policy-config fcfs --sync-scheduling
+  # MARS ablation: full MARS but demotion disabled, no chunk
+  run MARS_no_demote_no_chunk_sync "$q" --api-policy V --policy-config V2 --swap \
+      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling --no-demote
+  # MARS ablation: full MARS but demotion disabled, no chunk, no starvation
+  run MARS_no_demote_no_chunk_no_starvation_sync "$q" --api-policy V --policy-config V2 --swap \
+      --sync-scheduling --no-demote
+
+  # # Vanilla vLLM baseline: discard (recompute) + FCFS.
+  # run Discard_sync "$q" --api-policy D --policy-config fcfs --sync-scheduling
+  # # Always preserve
+  # run Preserve_sync "$q" --api-policy P --policy-config fcfs --sync-scheduling
+
   # Always swap
   run Swap_sync "$q" --api-policy S --policy-config fcfs --swap --sync-scheduling
+  # Always swap, with V2 queue 
+  run Swap_V2_sync "$q" --api-policy S --policy-config V2 --swap --sync-scheduling
 done
 
 echo "per-config CSVs written to $OUT/"

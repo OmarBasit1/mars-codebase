@@ -1,12 +1,8 @@
-"""No-GPU unit test: combined V2/SJF ordering across waiting + skipped_waiting.
+"""Unit test: combined V2/SJF ordering across waiting + skipped_waiting (no GPU).
 
 Locks the contract that _select_waiting_queue_for_scheduling picks whichever
 non-empty queue has the smaller head key, and that a starving request (-inf)
 wins regardless of which queue it lives in.
-
-Run from /tmp to avoid cwd import shadowing:
-    cd /tmp && /export2/obasit/MARS_derivative/vllm/.venv/bin/python \
-        /export2/obasit/MARS_derivative/mars-codebase/mars_port/examples/combined_queue_test.py
 """
 
 from types import SimpleNamespace

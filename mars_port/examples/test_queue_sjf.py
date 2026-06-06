@@ -1,4 +1,4 @@
-"""Phase 5 unit test: SJF MARSRequestQueue ordering (no GPU).
+"""Unit test: SJF MARSRequestQueue ordering (no GPU).
 
 Requests are popped shortest-`remain_length`-first, with stable ordering for
 equal keys, and the queue supports peek/len/bool/remove/iter.
@@ -39,7 +39,7 @@ def main() -> None:
     assert order == ["b", "d", "a"], order
     assert not q and len(q) == 0
     print("SJF pop order (c removed):", order)
-    print(">>> PHASE5_SJF_QUEUE_OK")
+    print(">>> SJF_QUEUE_OK")
 
 
 if __name__ == "__main__":

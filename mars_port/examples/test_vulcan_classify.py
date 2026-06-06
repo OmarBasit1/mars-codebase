@@ -1,4 +1,4 @@
-"""Phase 4 end-to-end: adaptive Vulcan ('V') classifies its strategy at arrival.
+"""Vulcan classify end-to-end: strategy assigned at arrival from predicted length.
 
 Faithful to the original, classify() runs at ARRIVAL on the predicted length and
 records the KV strategy; the V request then always PAUSES as PRESERVE, and the
@@ -7,11 +7,13 @@ needs memory pressure + waiting work). This test runs two V requests with no
 contention, so neither is demoted -- both just preserve and finish. The strategy
 choice is surfaced by the arrival ``[MARS] classify ... -> strategy=...`` log:
 one with a SHORT predicted API time (holding KV is cheap -> preserve) and one
-with a LONG predicted API time (holding wastes memory-time -> recompute). The
-bash wrapper greps those classify lines.
+with a LONG predicted API time (holding wastes memory-time -> recompute).
 
 (``api_exec_time`` -- the orchestrator's simulated sleep -- is kept small for
 speed; ``predicted_api_exec_time`` -- what classify reads -- drives the decision.)
+
+Run from a neutral cwd:
+    cd /tmp && CUDA_VISIBLE_DEVICES=0 .venv/bin/python examples/test_vulcan_classify.py
 """
 
 import asyncio
@@ -65,7 +67,7 @@ async def main() -> None:
     print("V_long  finished/pauses/gen:", r_long.finished, r_long.pauses, r_long.total_generated)
     assert r_short.finished and r_long.finished, "request did not finish"
     assert r_short.pauses == N_PAUSES and r_long.pauses == N_PAUSES, "wrong pause count"
-    print(">>> PHASE4_VULCAN_E2E_OK")
+    print(">>> VULCAN_CLASSIFY_E2E_OK")
     engine.shutdown()
 
 

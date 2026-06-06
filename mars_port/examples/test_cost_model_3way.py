@@ -1,8 +1,8 @@
-"""Phase 6 unit test: 3-way Vulcan cost model (no GPU).
+"""Unit test: 3-way cost model with swap (no GPU).
 
 Confirms ``choose`` evaluates SWAP only when available, and that SWAP can be
-selected when it is the minimum-waste option (here via cheaper swap-transfer
-coefficients + a long API and heavy recompute contention).
+selected when it is the minimum-waste option (cheaper swap-transfer coefficients
++ long API + heavy recompute contention).
 """
 
 from mars.cost_model import CostModel, CostModelCoeffs
@@ -33,7 +33,7 @@ def main() -> None:
     smode, sw = cheap.choose(swap_available=True, **sctx)
     print("cheap-swap regime:", {m.value: round(w, 2) for m, w in sw.items()}, "->", smode.value)
     assert smode is PauseMode.SWAP, (smode, sw)
-    print(">>> PHASE6_COST_3WAY_OK")
+    print(">>> COST_MODEL_3WAY_OK")
 
 
 if __name__ == "__main__":
