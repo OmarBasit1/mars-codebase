@@ -401,8 +401,13 @@ class _MARSSchedulerMixin:
                 self._mars_rekey_v2()
         # Dynamic memory-pressure demotion (default on; --no-demote disables).
         # Decoupled from chunk_fill, which now controls only the per-step
-        # token-budget cap.
-        if self.mars_config.demote_paused and len(self.mars_paused_preserved) > 1:
+        # token-budget cap. The on-demand mode skips this proactive pass and frees
+        # KV lazily in _reclaim_blocks_for_admission instead.
+        if (
+            self.mars_config.demote_paused
+            and not self.mars_config.demote_ondemand
+            and len(self.mars_paused_preserved) > 1
+        ):
             self._mars_demote_paused()
         return super().schedule()
 
@@ -700,6 +705,8 @@ class _MARSSchedulerMixin:
         ``combined_targets`` — the safety net that made the original immune to
         memory-over-commit deadlocks.
         """
+        if self.mars_config.demote_paused and self.mars_config.demote_ondemand:
+            return self._reclaim_ondemand(request, num_new_tokens)
         # Only intervene when running=0 (true deadlock: vLLM's native
         # running-queue preemption has no victims). When running > 0, native
         # preemption already handles memory pressure; intervening causes a
@@ -759,6 +766,54 @@ class _MARSSchedulerMixin:
         # the freed memory available. Returning True (retry same step) causes a
         # free→re-admit→re-hold churn cycle at high load.
         return False
+
+    def _reclaim_ondemand(self, request: Request, num_new_tokens: int) -> bool:
+        """Lazy, minimal demotion: free only enough preserved-paused KV to admit.
+
+        On-demand counterpart to the proactive ``_mars_demote_paused`` (used when
+        ``demote_ondemand``). Fires when a request fails to allocate GPU blocks.
+        Frees the MINIMUM number of preserved API-waiting requests -- lowest
+        arrival-waste first, so the costliest-to-redo stay pinned longest --
+        needed to cover this (chunked) admission, then defers one step (returns
+        False) so the freed memory admits the request next ``schedule()``.
+        Demoted requests reload only at their API resume (``pending_reset``),
+        never proactively. Unlike the running==0 backstop this runs under any
+        running count: parked ``WAITING_FOR_STREAMING_REQ`` holders are invisible
+        to vLLM's native running-queue preemption, so only MARS can reclaim them.
+        """
+        admit_id = request.request_id
+        bs = self._block_size
+        blocks_needed = (num_new_tokens + bs - 1) // bs
+        pool = self.kv_cache_manager.block_pool
+        if pool.get_num_free_blocks() >= blocks_needed:
+            return False  # enough free already (alloc failed for another reason)
+        # Eligible victims: preserved API-waiting holders, demotable, not in-flight.
+        victims = []
+        for rid, req in self.mars_paused_preserved.items():
+            if rid == admit_id or self._mars_request_inflight(req):
+                continue
+            mode, waste = self._demote_choice(rid, req)
+            if mode is None:  # 'preserve'-classified: never demote, stays pinned
+                continue
+            victims.append((waste, rid, req, mode))
+        if not victims:
+            return False
+        # Free cheapest-to-lose first; keep the highest-waste pinned longest.
+        victims.sort(key=lambda x: x[0])
+        usage = self.kv_cache_manager.usage
+        freed = 0
+        for waste, rid, req, mode in victims:
+            if pool.get_num_free_blocks() >= blocks_needed:
+                break  # minimum reached
+            self._demote(rid, req, mode, waste, usage)
+            self.mars_reclaims += 1
+            freed += 1
+        if freed:
+            logger.info(
+                "[MARS] ondemand reclaim: freed %d preserved-paused req(s) "
+                "(need %d blk) to admit req=%s", freed, blocks_needed, admit_id,
+            )
+        return False  # defer one step; next schedule() admits with freed memory
 
     def _demote_choice(self, rid: str, request: Request):
         """``(mode, waste)`` to demote a preserved-paused request, from classify().

@@ -228,7 +228,8 @@ Results are written as per-request CSVs to `$OUT/`.
 | `--swap` | Enable `SimpleCPUOffloadConnector` (required for S and swap-aware V) |
 | `--chunk-fill` | Enable per-step token-budget cap (decoupled from demotion) |
 | `--chunk-size N` | Per-step token budget when chunk-fill is on (0 = engine default) |
-| `--no-demote` | Disable dynamic memory-pressure demotion (on by default) |
+| `--no-demote` | Disable dynamic memory-pressure demotion entirely |
+| `--demote-proactive` | Use the original per-step proactive demotion instead of the default on-demand (lazy/minimal) demotion (ablation) |
 | `--starvation-avoidance` | Enable anti-starvation boosting |
 | `--starvation-threshold N` | Steps before a request is boosted |
 | `--starvation-quantum N` | Steps the boost lasts |
@@ -259,7 +260,7 @@ bash MARS_derivative/mars-codebase/exps/run_a40.sh
 | `P` | Preserve | Keep KV blocks pinned; resume immediately |
 | `D` | Discard/Recompute | Free KV; recompute on resume (wastes GPU compute) |
 | `S` | Swap | Free KV to CPU host; reload async on resume |
-| `V` | Vulcan (adaptive) | Classify at arrival (predict P/S/D by cost model); always pause as P; demote every step to cheapest option under memory pressure |
+| `V` | Vulcan (adaptive) | Classify at arrival (predict P/S/D by cost model); always pause as P; demote to the arrival strategy **on-demand** — only the minimum preserved KV freed when a new request can't allocate (best-measured policy; `--demote-proactive` for the original every-step variant) |
 
 ---
 

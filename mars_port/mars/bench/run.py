@@ -125,6 +125,7 @@ async def main_async(args: argparse.Namespace) -> None:
             chunk_fill=args.chunk_fill,
             chunk_size=args.chunk_size,
             demote_paused=not args.no_demote,
+            demote_ondemand=not args.demote_proactive,
             starvation_avoidance=args.starvation_avoidance,
             starvation_threshold=args.starvation_threshold,
             starvation_quantum=args.starvation_quantum,
@@ -279,7 +280,10 @@ def main() -> None:
     ap.add_argument("--chunk-fill", action="store_true")
     ap.add_argument("--chunk-size", type=int, default=0)
     ap.add_argument("--no-demote", action="store_true",
-                    help="disable dynamic memory-pressure demotion (on by default)")
+                    help="disable dynamic memory-pressure demotion entirely")
+    ap.add_argument("--demote-proactive", action="store_true",
+                    help="use the original per-step proactive demotion instead of "
+                         "the default on-demand (lazy/minimal) demotion (ablation)")
     ap.add_argument("--starvation-avoidance", action="store_true")
     ap.add_argument("--starvation-threshold", type=int, default=100)
     ap.add_argument("--starvation-quantum", type=int, default=100000)

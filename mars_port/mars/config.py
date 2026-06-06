@@ -102,13 +102,24 @@ class MarsConfig:
     # Host<->GPU KV transfer latency (s/token), profiled by calibrate_cost.py.
     # Drives the v1 async-overlap swap-waste model.
     per_token_swap_latency: float | None = None
-    # Dynamic memory-pressure demotion (V policy). Enabled by default.
-    # Every step, keep only the single highest-waste preserved-paused request
-    # pinned and demote the rest (free their KV -> swap / recompute) so the freed
-    # memory can admit waiting work. Pure 'P' is never demoted. Gated only on
-    # pending admission demand (requests waiting). Set False to ablate demotion
-    # entirely (preserved-paused KV is then only reclaimed by the running==0 safety net).
+    # Master switch for dynamic memory-pressure demotion (V policy). On by
+    # default. Set False (``--no-demote``) to ablate demotion entirely:
+    # preserved-paused KV is then only reclaimed by the running==0 safety net.
     demote_paused: bool = True
+    # Demotion strategy when demote_paused is on. DEFAULT (True) = on-demand:
+    # preserved API-waiting requests keep their KV until a NEW request fails to
+    # allocate GPU blocks, at which point only the MINIMUM number of
+    # preserved-paused requests needed to fit that (chunked) admission are freed
+    # (lowest-waste first; CPU offload already holds their KV via the write-through
+    # cache). Demoted requests reload only when their API wait ends (never
+    # proactively on free memory). This is the best-measured policy across qps
+    # 3-13 -- dormant at low load (== no-demote) and beats no-demote/Swap at
+    # saturation, with no meltdown.
+    # False (``--demote-proactive``) = the original per-step pass: every step keep
+    # only the single highest-waste preserved-paused request pinned and demote the
+    # rest. Faithful to the original _schedule_chunk_and_fill but churns
+    # swap-out/reload and degrades badly under load (kept as an ablation).
+    demote_ondemand: bool = True
     # Path to a JSONL sidecar file where the scheduler writes one record per
     # finished request (policy, arrival_strategy, swap_reloads).  Empty = disabled.
     # Set by the bench harness so it can enrich the per-request CSV.

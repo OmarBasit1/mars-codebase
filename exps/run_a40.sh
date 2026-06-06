@@ -48,9 +48,14 @@ for q in $QPS_LIST; do
   # # Always swap
   # run Swap_async "$q" --api-policy S --policy-config fcfs --swap
 
-  # MARS: V + V2 queue + chunk-fill (token budget 1024) + CPU-offload swap + starvation.
+  # MARS (headline): V + V2 + chunk-fill 1024 + swap + starvation. Demotion is
+  # ON-DEMAND by default (lazy/minimal free-on-admission) -- the best policy across
+  # the qps sweep (beats no-demote and Swap at saturation, no meltdown).
   run MARS_sync "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
       --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling
+  # MARS ablation: original per-step PROACTIVE demotion (degrades badly under load).
+  run MARS_proactive_sync "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
+      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling --demote-proactive
   # MARS ablation: full MARS but demotion disabled (isolate the demotion effect).
   run MARS_no_demote_sync "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 1024 --swap \
       --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling --no-demote
