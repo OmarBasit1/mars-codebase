@@ -62,7 +62,10 @@ subsystem, what the original did, what the port does, and any **discrepancy**.
 
 ### Memory-pressure admission / passive_discard
 - **Original**: `passive_discard_by_order` over `combined_targets` evicted the lowest-priority victim inline when admission was blocked — immune to deadlock.
-- **Port**: `_reclaim_blocks_for_admission` hook (vLLM `mars-port` edit, default `return False`). When admission is blocked **and `running==0`**, picks the lowest-V2-priority KV-holder from `mars_resumed_preserved` (resumed-PRESERVE holders), `skipped_waiting` (WAITING with `num_computed_tokens>0`), or in-flight `WAITING_FOR_REMOTE_KVS` loads, calls `_demote` to free its KV, and returns False — admission resumes next step. The base call site ignores the return and always breaks (no same-step retry; the bool is advisory). Counter `mars_reclaims` + `[MARS] reclaim …` log.
+- **Port**: `_reclaim_blocks_for_admission` hook (vLLM `mars-port` edit, default `return False`). Two roles depending on the demotion mode:
+  - **on-demand demotion (default)** routes through this hook as its *primary* mechanism (`_reclaim_ondemand`): fires whenever admission is blocked **under any running count**, freeing the minimum preserved-paused KV needed (see *Dynamic memory-pressure demotion* above).
+  - **proactive / `--no-demote` modes** use it only as the `running==0` deadlock backstop: picks the lowest-V2-priority KV-holder from `mars_resumed_preserved` (resumed-PRESERVE holders), `skipped_waiting` (WAITING with `num_computed_tokens>0`), or in-flight `WAITING_FOR_REMOTE_KVS` loads, calls `_demote`, and returns False.
+  Either way the base call site ignores the return and breaks (no same-step retry; the freed memory admits next step; the bool is advisory). Counter `mars_reclaims` + `[MARS] reclaim …` log.
 - **Faithful**: admission is blocked only when no KV-holding waiting request exists — matching the original's safety property.
 
 ### KV bookkeeping
