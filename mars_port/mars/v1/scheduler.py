@@ -81,14 +81,6 @@ class _MarsReqState:
     # Drives the V2 score's ``api_complete`` branch after the final call, like
     # the original's per-call api_max_calls decrement in llm_engine.
     remaining_api_calls: int = 0
-    # Proactive preload (COMPARISON #2): a SWAP-demoted parked request whose
-    # host->GPU reload was started *during* the API wait. ``kv_preload_inflight``
-    # while the copy runs; ``kv_preloaded`` once it lands (KV resident, parked);
-    # ``preload_len`` is the #tokens whose KV the preload reconstructed (used to
-    # set num_computed_tokens at resume so the 1-token connector gap is recomputed).
-    kv_preload_inflight: bool = False
-    kv_preloaded: bool = False
-    preload_len: int = 0
 
 
 class _MARSSchedulerMixin:
@@ -200,15 +192,6 @@ class _MARSSchedulerMixin:
         self.mars_reclaims = 0  # passive_discard invocations
         # V2 amortization counter (C2): rekey only every rekey_interval steps.
         self._mars_rekey_counter: int = 0
-        # Proactive preload (COMPARISON #2, opt-in). Only active with a connector.
-        self._preload_on = bool(
-            self.mars_config.proactive_preload and self._swap_available
-        )
-        # SWAP-demoted, still-parked requests whose KV is on host -> preload-eligible.
-        self._mars_swapped_parked: dict[str, Request] = {}
-        # Requests whose host->GPU preload copy is currently in flight.
-        self._mars_preloading: dict[str, Request] = {}
-        self.mars_preloads = 0  # preloads started
         logger.info(
             "[MARS] scheduler active: api_policy=%s policy_config=%s "
             "swap_available=%s block_size=%s chunk_fill=%s per_req_stats=%r",
@@ -218,10 +201,6 @@ class _MARSSchedulerMixin:
             self._block_size,
             self.mars_config.chunk_fill,
             self.mars_config.per_req_stats_path or "(disabled)",
-        )
-        logger.info(
-            "[MARS] preload_on=%s (proactive_preload=%s swap_available=%s)",
-            self._preload_on, self.mars_config.proactive_preload, self._swap_available,
         )
 
     # --- policy resolution -------------------------------------------------
@@ -356,7 +335,6 @@ class _MARSSchedulerMixin:
             # Reload the KV from the prefix cache / CPU-offload host on resume.
             st.pending_skip_prefix = False
             self.mars_swap_count += 1
-            self._mark_swap_parked(request)
             logger.info(
                 "[MARS] pause req=%s policy=%s mode=swap (freed KV -> host)%s",
                 request.request_id,
@@ -426,12 +404,6 @@ class _MARSSchedulerMixin:
         # token-budget cap.
         if self.mars_config.demote_paused and len(self.mars_paused_preserved) > 1:
             self._mars_demote_paused()
-        # Proactive preload (opt-in): start the host->GPU reload of SWAP-demoted
-        # parked requests while they wait, if GPU memory is spare. Runs AFTER
-        # demotion so it never fights it for memory (demotion frees, preload only
-        # uses leftover headroom).
-        if self._preload_on and self._mars_swapped_parked:
-            self._mars_preload_parked()
         return super().schedule()
 
     def _select_waiting_queue_for_scheduling(self):
@@ -631,10 +603,6 @@ class _MARSSchedulerMixin:
         if not self.waiting and not (self._mars_queues and self.skipped_waiting):
             return
         usage = self.kv_cache_manager.usage
-        # Optional usage floor (0 => no gate, the faithful default).
-        threshold = self.mars_config.demote_pressure_threshold
-        if threshold > 0 and usage < threshold:
-            return
         # Faithful to the original _schedule_chunk_and_fill: max_waste is taken
         # over ALL paused-preserve requests -- including 'preserve'-classified
         # ones (which are never demoted) and in-flight ones (still pinned) -- and
@@ -846,10 +814,6 @@ class _MARSSchedulerMixin:
         if mode is PauseMode.SWAP:
             st.pending_skip_prefix = False
             self.mars_swap_count += 1
-            # A SWAP-demoted request that is still parked for the API becomes
-            # preload-eligible (reload its host KV during the wait if memory frees).
-            if entry_status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                self._mark_swap_parked(request)
         else:
             st.pending_skip_prefix = self.mars_config.recompute_skip_prefix_cache
             self.mars_recompute_count += 1
@@ -882,182 +846,15 @@ class _MARSSchedulerMixin:
             len(self.mars_paused_preserved),
         )
 
-    # --- proactive mid-wait preload (COMPARISON #2, opt-in) ----------------
-
-    def _mark_swap_parked(self, request: Request) -> None:
-        """Register a SWAP-demoted, still-parked request as preload-eligible."""
-        if self._preload_on and request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            self._mars_swapped_parked[request.request_id] = request
-
-    def _mars_preload_parked(self) -> None:
-        """Start the host->GPU reload of SWAP-demoted parked requests, mid-wait.
-
-        Only when GPU memory is spare (``usage < preload_headroom``) and there is
-        no waiting-compute demand that needs the memory more (preloading would
-        otherwise re-occupy what the swap just freed and starve admission). Drives
-        the connector's normal async-load machinery WITHOUT changing the request's
-        status: the request stays parked (``WAITING_FOR_STREAMING_REQ``, never
-        promoted by ``_try_promote_blocked_waiting_request``), its KV is allocated
-        + copied host->GPU by the worker, and the completion is caught by
-        :meth:`_update_from_kv_xfer_finished`. Loads emit from the connector's
-        ``_reqs_to_load`` independent of scheduling, so no core edit is needed.
-        """
-        # Drop entries that left the parked state (resumed / finished / re-demoted).
-        for rid in list(self._mars_swapped_parked):
-            req = self._mars_swapped_parked[rid]
-            st = self.mars_state.get(rid)
-            if (st is None or not st.pending_reset
-                    or req.status != RequestStatus.WAITING_FOR_STREAMING_REQ
-                    or rid in self._mars_preloading):
-                self._mars_swapped_parked.pop(rid, None)
-        if not self._mars_swapped_parked:
-            return
-        # Spare-memory gate (the only gate): only preload while KV usage is below
-        # preload_headroom, i.e. there is slack the preload can use without
-        # competing with admission. The headroom floor + the per-step cap keep
-        # preload from re-occupying memory that admission needs; if pressure
-        # later returns, the every-step demotion/reclaim frees the preloaded KV
-        # again. (A separate "is anything waiting?" gate was too strict -- a busy
-        # system almost always has a WAITING request, so it never fired.)
-        usage = self.kv_cache_manager.usage
-        if usage >= self.mars_config.preload_headroom:
-            logger.debug("[MARS] preload skip: usage=%.2f >= headroom", usage)
-            return
-        started = 0
-        for rid in list(self._mars_swapped_parked):
-            if started >= self.mars_config.preload_per_step:
-                break
-            req = self._mars_swapped_parked[rid]
-            if self._start_preload(rid, req):
-                self._mars_swapped_parked.pop(rid, None)
-                self._mars_preloading[rid] = req
-                started += 1
-            else:
-                break  # out of memory this step; try again next step
-
-    def _start_preload(self, rid: str, request: Request) -> bool:
-        """Allocate GPU blocks + register the host->GPU load for ``request``.
-
-        Returns True if the load was started. Mirrors the base scheduler's
-        async-KV admission shape (``get_num_new_matched_tokens`` -> ``allocate_slots``
-        with ``delay_cache_blocks`` -> ``update_state_after_alloc``) but without
-        promoting the request to a schedulable state -- it stays parked.
-        """
-        if self.connector is None:
-            return False
-        # Locally-cached prefix (GPU), then the host (CPU-offload) match.
-        new_computed_blocks, num_local = self.kv_cache_manager.get_computed_blocks(request)
-        ext, is_async = self.connector.get_num_new_matched_tokens(request, num_local)
-        if not is_async or not ext:
-            # Nothing to preload: the swap-freed KV is still in the GPU prefix
-            # cache (served locally, is_async=False) -- the host-resident path
-            # only engages once those blocks are evicted under real pressure.
-            return False
-        new_blocks = self.kv_cache_manager.allocate_slots(
-            request,
-            0,
-            num_new_computed_tokens=num_local,
-            new_computed_blocks=new_computed_blocks,
-            num_external_computed_tokens=ext,
-            delay_cache_blocks=True,
-        )
-        if new_blocks is None:
-            return False  # no GPU room this step
-        self.connector.update_state_after_alloc(
-            request, self.kv_cache_manager.get_blocks(rid), ext
-        )
-        st = self.mars_state.get(rid)
-        if st is not None:
-            st.kv_preload_inflight = True
-            st.preload_len = num_local + ext
-        self.mars_preloads += 1
-        logger.info(
-            "[MARS] preload start req=%s (host->GPU %d tok, mid-wait)", rid, num_local + ext
-        )
-        return True
-
-    def _on_preload_finished(self, rid: str) -> None:
-        """Host->GPU preload landed: KV resident, request still parked.
-
-        The request keeps its GPU blocks and stays ``WAITING_FOR_STREAMING_REQ``.
-        It becomes a normal pinned-KV paused request again (re-demotable under
-        pressure). At resume it is treated like PRESERVE (KV resident), with
-        ``num_computed_tokens`` set to the reloaded length so the 1-token connector
-        gap is recomputed.
-        """
-        req = self._mars_preloading.pop(rid, None)
-        st = self.mars_state.get(rid)
-        if req is None or st is None:
-            return
-        st.kv_preload_inflight = False
-        st.kv_preloaded = True
-        # KV is resident now -> no swap reload needed at resume.
-        st.pending_reset = False
-        st.pending_skip_prefix = False
-        self.mars_swap_reloads += 1  # the reload happened (just earlier, mid-wait)
-        st.swap_reloads += 1
-        # Re-demotable under pressure: a pinned-KV paused request again.
-        if st.policy_letter != "P":
-            self.mars_paused_preserved[rid] = req
-        logger.info("[MARS] preload done req=%s (KV resident, %d tok)", rid, st.preload_len)
-
-    def _cancel_preload(self, rid: str, request: Request) -> None:
-        """Abort an in-flight preload (e.g. the API returned first): free its KV."""
-        if self.connector is not None and hasattr(self.connector, "cancel_load_for_request"):
-            self.connector.cancel_load_for_request(request)
-        self.kv_cache_manager.free(request)
-        if hasattr(self, "finished_recving_kv_req_ids"):
-            self.finished_recving_kv_req_ids.discard(rid)
-        self._mars_preloading.pop(rid, None)
-        st = self.mars_state.get(rid)
-        if st is not None:
-            st.kv_preload_inflight = False
-
-    def _update_from_kv_xfer_finished(self, kv_connector_output):
-        """Intercept preload completions before the base handles xfer-finished.
-
-        A preload finish must NOT enter ``finished_recving_kv_req_ids`` (that would
-        promote the parked request for compute). Strip MARS-preload rids and apply
-        :meth:`_on_preload_finished`, then defer the rest to the base.
-        """
-        if self._mars_preloading and kv_connector_output.finished_recving:
-            done = [r for r in kv_connector_output.finished_recving
-                    if r in self._mars_preloading]
-            for rid in done:
-                self._on_preload_finished(rid)
-            if done:
-                kv_connector_output.finished_recving = (
-                    set(kv_connector_output.finished_recving) - set(done)
-                )
-        return super()._update_from_kv_xfer_finished(kv_connector_output)
-
     # --- resume hook -------------------------------------------------------
 
     def _update_request_as_session(self, session: Request, update) -> None:
         rid = session.request_id
         st = self.mars_state.get(rid)
-        # The API returned while a preload copy was still in flight: abort it and
-        # fall back to the normal reload-at-resume (pending_reset is still True,
-        # so the swap branch below resets num_computed=0 and reloads on admission).
-        if st is not None and st.kv_preload_inflight:
-            self._cancel_preload(rid, session)
         super()._update_request_as_session(session, update)
-        # Resuming -> no longer a preserved-paused / preload-eligible candidate.
+        # Resuming -> no longer a preserved-paused candidate.
         self.mars_paused_preserved.pop(rid, None)
-        self._mars_swapped_parked.pop(rid, None)
-        if st is not None and st.kv_preloaded:
-            # KV was reloaded mid-wait and is resident -> resume like PRESERVE.
-            # num_computed_tokens is set to the reloaded length so the 1-token
-            # connector gap (max_hit_len = num_tokens-1) is recomputed at admission;
-            # the fold above already kept all output (it ran with the full
-            # pre-pause num_computed_tokens). Byte-identical to the swap reload.
-            session.num_computed_tokens = st.preload_len
-            session.skip_reading_prefix_cache = False
-            st.kv_preloaded = False
-            st.preload_len = 0
-            st.pending_reset = False
-            self.mars_resumed_preserved[rid] = session
-        elif st is not None and not st.pending_reset:
+        if st is not None and not st.pending_reset:
             # KV blocks were NOT freed at pause (PRESERVE mode). The request
             # resumes holding its GPU blocks; track it so passive_discard can
             # reclaim them if memory is exhausted during admission.
@@ -1099,8 +896,6 @@ class _MARSSchedulerMixin:
         st = self.mars_state.pop(request.request_id, None)
         self.mars_paused_preserved.pop(request.request_id, None)
         self.mars_resumed_preserved.pop(request.request_id, None)
-        self._mars_swapped_parked.pop(request.request_id, None)
-        self._mars_preloading.pop(request.request_id, None)
         path = self.mars_config.per_req_stats_path
         if path and st is not None:
             # vLLM appends "-{8hex}" to every request_id for internal uniqueness

@@ -109,25 +109,6 @@ class MarsConfig:
     # pending admission demand (requests waiting). Set False to ablate demotion
     # entirely (preserved-paused KV is then only reclaimed by the running==0 safety net).
     demote_paused: bool = True
-    # Optional KV-usage floor for demotion. 0 (default) => faithful original:
-    # demote whenever work is waiting, regardless of usage. >0 => only demote
-    # once usage exceeds this fraction (re-enables the old pressure gate).
-    demote_pressure_threshold: float = 0.0
-    # Proactive mid-API-wait swap reload (COMPARISON #2). When on, a SWAP-demoted
-    # request whose KV is on host has its host->GPU reload STARTED while it is
-    # still parked for the API (if GPU memory is spare), so the KV is resident by
-    # the time the API returns -- instead of the default admission-gated reload
-    # that starts only after resume. Default OFF: the measured post-resume reload
-    # latency is ~1% of e2e (the async WFRKV path already overlaps it), so this is
-    # opt-in. Only meaningful with a CPU-offload connector (--swap). Gated on spare
-    # GPU memory (preload re-occupies the memory swap freed, so it self-limits and
-    # a re-demote reclaims it under pressure). See preload_headroom.
-    proactive_preload: bool = False
-    # Only preload when KV usage is below this fraction (spare GPU memory). Above
-    # it, leave demoted-SWAP requests on host (preloading would defeat the swap).
-    preload_headroom: float = 0.6
-    # Max preloads to START per schedule step (spreads PCIe traffic).
-    preload_per_step: int = 2
     # Path to a JSONL sidecar file where the scheduler writes one record per
     # finished request (policy, arrival_strategy, swap_reloads).  Empty = disabled.
     # Set by the bench harness so it can enrich the per-request CSV.

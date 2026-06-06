@@ -40,7 +40,6 @@ MARS_derivative/
     │   │   ├── test_vulcan_classify.py# E2E: V strategy assigned at arrival
     │   │   ├── test_swap.py           # E2E: P/S/D byte-identical with CPU offload
     │   │   ├── test_demotion.py       # E2E: KV demotion under memory pressure
-    │   │   ├── test_proactive_preload.py # E2E: proactive preload byte-identical guard
     │   │   ├── test_cost_model_2way.py   # Unit: preserve/recompute crossover (no GPU)
     │   │   ├── test_cost_model_3way.py   # Unit: 3-way cost model with swap (no GPU)
     │   │   ├── test_classify_v2.py       # Unit: classify at arrival + V2 ordering (no GPU)
@@ -174,7 +173,6 @@ Six end-to-end tests require a GPU; six unit tests require only the `mars` packa
 | `test_vulcan_classify.py` | yes | V assigns strategy at arrival from predicted API time, not at pause |
 | `test_swap.py` | yes | P, S, D produce byte-identical output with the CPU-offload connector |
 | `test_demotion.py` | yes | Dynamic KV demotion fires under memory pressure; all requests finish |
-| `test_proactive_preload.py` | yes | Proactive preload ON/OFF produces byte-identical output |
 | `test_cost_model_2way.py` | no | Preserve/recompute crossover is monotonic; `w_d` is API-time-independent |
 | `test_cost_model_3way.py` | no | 3-way `choose` selects SWAP only when available and cheapest |
 | `test_classify_v2.py` | no | Arrival classify picks correct strategy; V2 reorders queue with live batch |
@@ -228,7 +226,7 @@ Results are written as per-request CSVs to `$OUT/`.
 | `--api-policy` | KV policy: `P` preserve, `D` recompute, `S` swap, `V` Vulcan |
 | `--policy-config` | Queue ordering: `fcfs` (default), `V2` |
 | `--swap` | Enable `SimpleCPUOffloadConnector` (required for S and swap-aware V) |
-| `--chunk-fill` | Enable per-step token budget shaping (also enables demotion) |
+| `--chunk-fill` | Enable per-step token-budget cap (decoupled from demotion) |
 | `--chunk-size N` | Per-step token budget when chunk-fill is on (0 = engine default) |
 | `--no-demote` | Disable dynamic memory-pressure demotion (on by default) |
 | `--starvation-avoidance` | Enable anti-starvation boosting |

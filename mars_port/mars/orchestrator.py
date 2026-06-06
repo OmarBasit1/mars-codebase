@@ -66,7 +66,7 @@ class OrchestratorResult:
     start_time: float = 0.0
     first_token_time: float = 0.0
     end_time: float = 0.0
-    # Per-pause timing for the B measurement (proactive preload feasibility):
+    # Per-pause timing (measures post-resume reload latency on the critical path):
     #   resume_times[i]  = perf_counter() right after API inject for pause i
     #   post_resume_first_token_times[i] = perf_counter() when first token
     #       of segment i+1 arrives after the resume.
