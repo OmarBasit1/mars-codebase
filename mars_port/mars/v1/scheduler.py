@@ -153,6 +153,9 @@ class _MARSSchedulerMixin:
             self.mars_config.policy_config,
             self.mars_starving,
             self.mars_config.cost_max_ragged_batch,
+            self.cost_model.coeffs.a,
+            self.cost_model.coeffs.c,
+            self._block_size,
         )
         if mars_queue is not None:
             self.waiting = mars_queue
@@ -160,6 +163,9 @@ class _MARSSchedulerMixin:
                 self.mars_config.policy_config,
                 self.mars_starving,
                 self.mars_config.cost_max_ragged_batch,
+                self.cost_model.coeffs.a,
+                self.cost_model.coeffs.c,
+                self._block_size,
             )
         # Gate combined-queue overrides on MARS queues actually being active.
         self._mars_queues: bool = isinstance(self.waiting, _MarsHeapQueue)
@@ -472,14 +478,16 @@ class _MARSSchedulerMixin:
                 q.rekey(key_fn)
 
     def _mem_time(self, num_blocks: int, running_batch: int) -> float:
-        """V2 memory-time of computing ``num_blocks`` (ports calculate_memory_time_blocks).
+        """V2 memory-time of computing ``num_blocks`` (token-seconds).
 
-        Uses V2's own coefficients (a=0.1, c=10), distinct from the cost model's.
+        Uses the **profiled** forward coefficients (``cost_a``/``cost_c``), the same
+        ones the cost model uses -- so the V2 ordering score and the cost model are
+        on one calibrated scale (the original hand-tuned ``a=0.1, c=10`` are gone).
         """
         co = self.cost_model.coeffs
         c_h = max(co.max_ragged_batch - running_batch, 1)
         n = max((co.block_size * num_blocks + c_h - 1) // c_h, 1)
-        f_s = (0.1 * co.max_ragged_batch + 10.0) / 1000.0
+        f_s = (co.a * co.max_ragged_batch + co.c) / 1000.0
         return f_s * (1 + n) * n / 2 * c_h
 
     def _v2_score(self, request: Request, running_batch: int, running_blocks: int) -> float:
@@ -512,10 +520,15 @@ class _MARSSchedulerMixin:
             before_after = self._mem_time(before_blocks + after_blocks, running_batch)
             return before_after if api_complete else before + 0.0 + before_after
         if strat == "swap":
-            cpu_to_gpu_transfer_rate = 2  # original hyperparameter
-            swap = before_blocks * (before_blocks / cpu_to_gpu_transfer_rate) / 2
-            api = api_exec_time * 0.1  # integral_swap_weight
-            return (swap + after) if api_complete else before + swap + api + swap + after
+            # v1 write-through swap: swap-OUT is free (the original's first `swap`
+            # term is gone), and the swap-IN reload is priced by the SAME profiled
+            # cost_model.swap_waste used for classify/demotion -- so V2 ordering and
+            # the cost model agree (now both on the calibrated _mem_time scale).
+            reload_s = self.cost_model.swap_waste(
+                before_blocks, running_batch, running_blocks
+            )
+            api = api_exec_time * 0.1  # KV off-GPU during the wait: tiny residual
+            return (reload_s + after) if api_complete else before + api + reload_s + after
         # preserve
         api_memory = before_blocks * bs * api_exec_time
         return before + api_memory + after
