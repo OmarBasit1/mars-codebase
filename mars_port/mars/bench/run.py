@@ -115,6 +115,7 @@ async def main_async(args: argparse.Namespace) -> None:
         gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
+        tensor_parallel_size=args.tensor_parallel_size,
         load_format=args.load_format,
         disable_hybrid_kv_cache_manager=True,
         async_scheduling=not args.sync_scheduling,
@@ -296,6 +297,7 @@ def main() -> None:
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--max-num-seqs", type=int, default=256,
                     help="max concurrent sequences (vLLM default auto-sizes to ~128)")
+    ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--gpu-mem", type=float, default=0.4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--api-token", type=int, default=5000)

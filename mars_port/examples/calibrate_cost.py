@@ -26,6 +26,13 @@ from transformers import AutoConfig
 from vllm import LLM, SamplingParams, TokensPrompt
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def measure_prefill(llm: LLM, n_tokens: int, reps: int = 10) -> float:
     sp = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
     prompt = TokensPrompt(prompt_token_ids=list(range(10, 10 + n_tokens)))
@@ -78,10 +85,18 @@ def main() -> None:
     ap.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct")
     ap.add_argument("--max-model-len", type=int, default=32768)
     ap.add_argument("--load-format", default="auto")
+    ap.add_argument(
+        "--tensor-parallel-size",
+        "--tp",
+        dest="tensor_parallel_size",
+        type=positive_int,
+        default=1,
+        help="tensor parallelism degree for KV sizing and vLLM engine load",
+    )
     args = ap.parse_args()
 
     # --- SWAP (host<->GPU KV transfer) — run before LLM load to avoid memory pressure ---
-    bpt = kv_bytes_per_token_from_config(args.model)
+    bpt = kv_bytes_per_token_from_config(args.model, tp=args.tensor_parallel_size)
     counts = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     sw = measure_swap(bpt, counts)
     print(f"\n# swap (KV {bpt} bytes/token; D2H+H2D round-trip)")
@@ -98,7 +113,7 @@ def main() -> None:
     llm = LLM(
         model=args.model, enforce_eager=True, gpu_memory_utilization=0.95,
         max_model_len=args.max_model_len, max_num_batched_tokens=args.max_model_len,
-        load_format=args.load_format,
+        load_format=args.load_format, tensor_parallel_size=args.tensor_parallel_size,
     )
 
     lengths = [n for n in (8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768) if n <= args.max_model_len - 1]
