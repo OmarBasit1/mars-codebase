@@ -53,7 +53,8 @@ class RequestPlan:
 
 
 def build_request_plan(
-    segments_json: list[dict], *, api_policy: str, max_model_len: int
+    segments_json: list[dict], *, api_policy: str, max_model_len: int,
+    zero_api_time: bool = False,
 ) -> RequestPlan:
     """Map one workload request (list of segments) to a runnable plan."""
     seg0 = segments_json[0]
@@ -66,9 +67,15 @@ def build_request_plan(
         for s in segments_json
     ]
     # The orchestrator pauses after segments[0..n-2]; api params of the last
-    # segment are unused. api_wait = simulated latency of the realized pauses.
-    api_wait = sum(s.api_exec_time for s in api_segments[:-1] if s.api_exec_time > 0)
+    # segment are unused. Count the real API calls BEFORE optionally zeroing the
+    # wait so api_max_calls stays truthful -- ``--zero-api-time`` removes only the
+    # idle wall-clock (the pause/resume still happens), for max-RPS probing.
     n_calls = sum(1 for s in api_segments[:-1] if s.api_exec_time > 0)
+    if zero_api_time:
+        for s in api_segments:
+            s.api_exec_time = 0.0
+    # api_wait = simulated latency of the realized pauses (0 when zeroed).
+    api_wait = sum(s.api_exec_time for s in api_segments[:-1] if s.api_exec_time > 0)
 
     out_total = sum(s.gen_len for s in api_segments)
     prompt_tokens = int(seg0.get("prompt_tokens", 1))
@@ -126,6 +133,7 @@ async def main_async(args: argparse.Namespace) -> None:
             chunk_size=args.chunk_size,
             demote_paused=not args.no_demote,
             demote_ondemand=not args.demote_proactive,
+            demote_eager=args.demote_eager,
             starvation_avoidance=args.starvation_avoidance,
             starvation_threshold=args.starvation_threshold,
             starvation_quantum=args.starvation_quantum,
@@ -160,7 +168,9 @@ async def main_async(args: argparse.Namespace) -> None:
     engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**eng_kwargs))
 
     plans = [
-        build_request_plan(workload[k], api_policy=args.api_policy, max_model_len=args.max_model_len)
+        build_request_plan(workload[k], api_policy=args.api_policy,
+                           max_model_len=args.max_model_len,
+                           zero_api_time=args.zero_api_time)
         for k in selected
     ]
     arrivals: dict[str, float] = {}
@@ -212,6 +222,7 @@ async def main_async(args: argparse.Namespace) -> None:
     finished = [r for r in results if r.finished]
     total_gen = sum(r.total_generated for r in finished)
     norm_lat, ttft, e2e = [], [], []
+    total_input = 0  # prefill tokens over finished requests (for input_tokens_per_s)
     rows = []
     for r, plan in zip(results, plans):
         arr = arrivals.get(r.request_id, r.start_time)
@@ -236,17 +247,28 @@ async def main_async(args: argparse.Namespace) -> None:
             if ft > 0 and rt > 0
         ]
         pr_ttft_mean = float(np.mean(pr_ttfts)) if pr_ttfts else float("nan")
+        pr_ttft_last = pr_ttfts[-1] if pr_ttfts else float("nan")  # last realized resume
+        # Input (prefill) tokens: initial prompt + the API-return tokens injected
+        # at each realized resume (>=1 per resume, matching the orchestrator's
+        # empty-prompt guard). r.pauses == number of realized API resumes.
+        injected = sum(max(1, plan.segments[i].api_return_length) for i in range(r.pauses))
+        input_toks = len(plan.prompt_token_ids) + injected
+        if r.finished:
+            total_input += input_toks
         rows.append([r.request_id, r.finished, r.pauses, r.total_generated,
                      f"{plan.api_wait:.4f}", f"{e2e_i:.4f}", f"{ttft_i:.4f}", f"{nl_i:.6f}",
                      mars_rec.get("policy", ""),
                      mars_rec.get("arrival_strategy", ""),
                      mars_rec.get("swap_reloads", ""),
                      mars_rec.get("demotions", ""),
-                     f"{pr_ttft_mean:.4f}" if not np.isnan(pr_ttft_mean) else ""])
+                     f"{pr_ttft_mean:.4f}" if not np.isnan(pr_ttft_mean) else "",
+                     input_toks,
+                     f"{pr_ttft_last:.4f}" if not np.isnan(pr_ttft_last) else ""])
 
     print("=" * 56)
     print(f"policy={args.api_policy} policy_config={args.policy_config} "
-          f"swap={args.swap} chunk_fill={args.chunk_fill} demote={not args.no_demote}")
+          f"swap={args.swap} chunk_fill={args.chunk_fill} demote={not args.no_demote} "
+          f"eager={args.demote_eager}")
     print(f"requests: {len(results)}  finished: {len(finished)}  wall: {wall:.2f}s")
     print(f"output tokens: {total_gen}  throughput: {total_gen / wall:.1f} tok/s, "
           f"{len(finished) / wall:.3f} req/s")
@@ -262,9 +284,28 @@ async def main_async(args: argparse.Namespace) -> None:
             w.writerow(["request_id", "finished", "pauses", "gen_tokens",
                         "api_wait_s", "e2e_s", "ttft_s", "norm_lat_s_per_tok",
                         "kv_policy", "arrival_strategy", "swap_reloads",
-                        "demotions", "post_resume_ttft_s"])
+                        "demotions", "post_resume_ttft_s",
+                        "input_tokens", "last_resume_ttft_s"])
             w.writerows(rows)
         print(f"wrote per-request CSV -> {args.csv}")
+        # Run-level summary sidecar: the per-request CSV has no wall time or
+        # offered rate, so the parser reads those from here. Stem matches the CSV
+        # ("{tag}_{qps}.csv" -> "{tag}_{qps}.summary.json"); .json is ignored by
+        # the parser's *.csv glob.
+        summary_path = (args.csv[:-4] if args.csv.endswith(".csv") else args.csv) + ".summary.json"
+        with open(summary_path, "w") as sf:
+            json.dump({
+                "qps_workload": args.qps,
+                "window": args.window,
+                "wall_s": wall,
+                "requests": len(results),
+                "finished": len(finished),
+                "output_tokens": total_gen,
+                "input_tokens": total_input,
+                "policy": args.api_policy,
+                "policy_config": args.policy_config,
+            }, sf, indent=2)
+        print(f"wrote run summary -> {summary_path}")
 
 
 def main() -> None:
@@ -284,11 +325,17 @@ def main() -> None:
     ap.add_argument("--demote-proactive", action="store_true",
                     help="use the original per-step proactive demotion instead of "
                          "the default on-demand (lazy/minimal) demotion (ablation)")
+    ap.add_argument("--demote-eager", action="store_true",
+                    help="V policy: free recompute/swap-classified KV AT THE PAUSE "
+                         "(eager, like D/S) instead of preserving + demoting lazily")
     ap.add_argument("--starvation-avoidance", action="store_true")
     ap.add_argument("--starvation-threshold", type=int, default=100)
     ap.add_argument("--starvation-quantum", type=int, default=100000)
     ap.add_argument("--sync-scheduling", action="store_true",
                     help="force synchronous scheduling (async_scheduling=False)")
+    ap.add_argument("--zero-api-time", action="store_true",
+                    help="zero every segment's API wait (keep pause/resume + call "
+                         "count; removes only idle wall-clock) -- for max-RPS probing")
     ap.add_argument("--swap", action="store_true", help="enable SimpleCPUOffloadConnector")
     ap.add_argument("--cpu-gb", type=float, default=4.0)
     ap.add_argument("--prefix-cache", action="store_true")

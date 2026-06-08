@@ -120,6 +120,14 @@ class MarsConfig:
     # rest. Faithful to the original _schedule_chunk_and_fill but churns
     # swap-out/reload and degrades badly under load (kept as an ablation).
     demote_ondemand: bool = True
+    # Eager-drop (``V`` only): apply the arrival-classified strategy AT THE PAUSE --
+    # free recompute/swap-classified KV immediately (like the direct D/S policies)
+    # instead of preserving it and freeing lazily under memory pressure.
+    # 'preserve'-classified requests still stay pinned. Default False keeps the lazy
+    # on-demand/proactive behavior above. Gated on ``demote_paused`` (``--no-demote``
+    # forces pure preserve and wins). The eager free is counted as a demotion in the
+    # per-request stats so it categorizes as swap/recompute (``--demote-eager``).
+    demote_eager: bool = False
     # Path to a JSONL sidecar file where the scheduler writes one record per
     # finished request (policy, arrival_strategy, swap_reloads).  Empty = disabled.
     # Set by the bench harness so it can enrich the per-request CSV.

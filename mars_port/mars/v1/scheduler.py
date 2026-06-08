@@ -24,6 +24,8 @@ produce identical output tokens (verified by the Phase 3 smoke test).
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
@@ -198,6 +200,16 @@ class _MARSSchedulerMixin:
         self.mars_reclaims = 0  # passive_discard invocations
         # V2 amortization counter (C2): rekey only every rekey_interval steps.
         self._mars_rekey_counter: int = 0
+        # Stall diagnostics (enable with env MARS_DIAG=1): a throttled per-second
+        # heartbeat of the scheduler/memory state for debugging GPU-idle/CPU-busy
+        # spins (schedule() looping without dispatching a GPU batch). Near-zero
+        # overhead when disabled.
+        self._mars_diag: bool = bool(os.environ.get("MARS_DIAG"))
+        self._mars_diag_last: float = 0.0
+        self._mars_diag_steps: int = 0   # schedule() calls since last heartbeat
+        self._mars_reclaim_calls: int = 0  # reclaim invocations since last heartbeat
+        self._mars_reclaim_freed: int = 0  # victims actually freed since last heartbeat
+        self._mars_reclaim_earlyret: int = 0  # reclaim 'enough free' early-returns
         logger.info(
             "[MARS] scheduler active: api_policy=%s policy_config=%s "
             "swap_available=%s block_size=%s chunk_fill=%s per_req_stats=%r",
@@ -337,6 +349,14 @@ class _MARSSchedulerMixin:
         # cache bypassed) after the fold.
         self.kv_cache_manager.free(request)
         st.pending_reset = True
+        # For adaptive 'V', freeing KV at the pause IS an eager demotion to the
+        # arrival-classified strategy (demote_eager) -- count it like a lazy demotion
+        # so the per-request stats categorize it as swap/recompute (not preserve) and
+        # it shows in demoted_reqs. Direct D/S letters are NOT counted here (the
+        # parser keys those off the policy letter; they aren't "demoted").
+        if st.policy_letter == "V":
+            st.demotions += 1
+            self.mars_demotions += 1
         if mode is PauseMode.SWAP:
             # Reload the KV from the prefix cache / CPU-offload host on resume.
             st.pending_skip_prefix = False
@@ -361,16 +381,32 @@ class _MARSSchedulerMixin:
         """Resolve the concrete pause mode and a log-detail string.
 
         Routing by ``policy_letter``:
-          * ``V`` -> always PRESERVE at the pause (faithful to the original: the
-            swap/recompute classified at arrival is applied later by the every-step
-            demotion in :meth:`schedule` -- ``_mars_demote_paused``/
-            ``_demote_choice`` using the arrival-classified strategy).
+          * ``V`` -> PRESERVE at the pause by default, with the swap/recompute
+            classified at arrival applied later by demotion (``_mars_demote_paused``
+            / ``_reclaim_ondemand`` using the arrival-classified strategy). When
+            ``demote_eager`` is set, a recompute/swap-classified request is instead
+            freed AT THE PAUSE (like D/S); only 'preserve'-classified stays pinned.
           * ``P``/``D``/``S`` -> direct mode (swap degraded when unavailable).
         """
         if policy_letter == "V":
-            # Static PRESERVE at the pause; demotion applies the arrival strategy.
             st = self.mars_state.get(request.request_id)
             strat = st.arrival_strategy if st is not None else ""
+            # Eager-drop: apply the arrival strategy now instead of preserving and
+            # demoting lazily. Gated on demotion being enabled at all (--no-demote
+            # forces pure preserve and wins).
+            if (
+                self.mars_config.demote_eager
+                and self.mars_config.demote_paused
+                and strat in ("recompute", "swap")
+            ):
+                mode = PauseMode.SWAP if strat == "swap" else PauseMode.RECOMPUTE
+                mode = degrade_swap(
+                    mode,
+                    swap_available=self._swap_available,
+                    swap_fallback=self.mars_config.swap_fallback,
+                )
+                return mode, f" (eager-drop; arrival_strategy={strat})"
+            # Static PRESERVE at the pause; lazy demotion applies the arrival strategy.
             return PauseMode.PRESERVE, f" (preserve; arrival_strategy={strat or '?'})"
         # Direct P / D / S.
         mode = decide_pause_mode(
@@ -415,7 +451,63 @@ class _MARSSchedulerMixin:
             and len(self.mars_paused_preserved) > 1
         ):
             self._mars_demote_paused()
-        return super().schedule()
+        out = super().schedule()
+        self._mars_diag_heartbeat(out)
+        return out
+
+    def _mars_diag_heartbeat(self, out) -> None:
+        """Throttled (1/s) scheduler-state heartbeat for stall debugging (MARS_DIAG=1).
+
+        Captures the frozen state during a GPU-idle/CPU-busy spin:
+          * ``steps`` -- schedule() calls in the last second; a huge value is the hot
+            CPU spin (scheduler looping, dispatching nothing); a tiny value means the
+            engine is blocked elsewhere (model exec / a stuck KV transfer).
+          * ``sched_tok`` -- tokens dispatched this step (0 => GPU got no work).
+          * running / waiting / skipped / paused_pre / resumed_pre counts.
+          * ``wait_status`` -- status histogram across the waiting queues;
+            ``WAITING_FOR_REMOTE_KVS`` = in-flight swap reloads holding GPU blocks.
+          * kv usage / free blocks, and reclaim activity (calls/freed) in the second.
+        """
+        if not self._mars_diag:
+            return
+        self._mars_diag_steps += 1
+        now = time.monotonic()
+        if now - self._mars_diag_last < 1.0:
+            return
+        try:
+            hist: dict[str, int] = {}
+            for q in (self.waiting, self.skipped_waiting):
+                it = q.iter_unsorted() if hasattr(q, "iter_unsorted") else iter(q)
+                for r in it:
+                    hist[r.status.name] = hist.get(r.status.name, 0) + 1
+            free_blk = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            kvhold = len(self._mars_kv_holding_waiting())
+            rp_wait = sum(1 for r in self.mars_resumed_preserved.values()
+                          if r.status == RequestStatus.WAITING)
+            rp_infl = sum(1 for r in self.mars_resumed_preserved.values()
+                          if self._mars_request_inflight(r))
+            logger.info(
+                "[MARS][diag] dt=%.2fs steps=%d sched_tok=%s running=%d waiting=%d "
+                "skipped=%d paused_pre=%d resumed_pre=%d(wait=%d infl=%d) kvhold=%d "
+                "kv_usage=%.3f free_blk=%d reclaim(calls=%d freed=%d earlyret=%d) "
+                "wait_status=%s",
+                now - self._mars_diag_last, self._mars_diag_steps,
+                getattr(out, "total_num_scheduled_tokens", "?"),
+                len(self.running), len(self.waiting), len(self.skipped_waiting),
+                len(self.mars_paused_preserved), len(self.mars_resumed_preserved),
+                rp_wait, rp_infl, kvhold,
+                self.kv_cache_manager.usage, free_blk,
+                self._mars_reclaim_calls, self._mars_reclaim_freed,
+                self._mars_reclaim_earlyret, hist,
+            )
+        except Exception as e:  # diagnostics must never break the run
+            logger.warning("[MARS][diag] heartbeat error: %s", e)
+        finally:
+            self._mars_diag_last = now
+            self._mars_diag_steps = 0
+            self._mars_reclaim_calls = 0
+            self._mars_reclaim_freed = 0
+            self._mars_reclaim_earlyret = 0
 
     def _select_waiting_queue_for_scheduling(self):
         """Combined V2/SJF ordering across ``waiting`` and ``skipped_waiting``.
@@ -718,6 +810,8 @@ class _MARSSchedulerMixin:
         ``combined_targets`` — the safety net that made the original immune to
         memory-over-commit deadlocks.
         """
+        if self._mars_diag:
+            self._mars_reclaim_calls += 1
         if self.mars_config.demote_paused and self.mars_config.demote_ondemand:
             return self._reclaim_ondemand(request, num_new_tokens)
         # Only intervene when running=0 (true deadlock: vLLM's native
@@ -793,35 +887,110 @@ class _MARSSchedulerMixin:
         never proactively. Unlike the running==0 backstop this runs under any
         running count: parked ``WAITING_FOR_STREAMING_REQ`` holders are invisible
         to vLLM's native running-queue preemption, so only MARS can reclaim them.
+
+        Two tiers of victim (both from ``mars_paused_preserved``):
+          * tier 1 -- demotable (swap/recompute-classified): freed by the cost
+            model, cheapest-waste first.
+          * tier 2 (emergency) -- preserve-classified pins (``mode=None``), which
+            are normally never freed, are FORCE-FREED here as a last resort when
+            tier 1 can't cover the admission, each via the cheaper of recompute/swap
+            (``_forced_free_mode``). So a memory-blocked waiting
+            chunk never stalls on idle preserved API KV -- instead of waiting for
+            running to drain to 0 (the running==0 backstop). Tier 2 stays empty in
+            lazy mode whenever swap/recompute victims remain (the documented lazy
+            behavior is unchanged); it is the ONLY tier in eager mode, where every
+            paused request is preserve-classified.
         """
         admit_id = request.request_id
         bs = self._block_size
         blocks_needed = (num_new_tokens + bs - 1) // bs
         pool = self.kv_cache_manager.block_pool
-        if pool.get_num_free_blocks() >= blocks_needed:
-            return False  # enough free already (alloc failed for another reason)
-        # Eligible victims: preserved API-waiting holders, demotable, not in-flight.
+        if pool.get_num_free_blocks() >= blocks_needed and self.running:
+            # Enough raw blocks free and something is running -> the alloc failed for
+            # another reason (e.g. a KV reload needs its whole context, which
+            # blocks_needed under-counts); let native preemption handle it. At
+            # running==0 do NOT bail here: that is a true deadlock and tier-3 must run.
+            if self._mars_diag:
+                self._mars_reclaim_earlyret += 1
+            return False
+        # Eligible holders: preserved API-waiting requests, not in-flight. Split by
+        # arrival strategy into demotable victims (tier 1) and preserve-classified
+        # pins (tier 2 emergency, force-freed via the cheaper of recompute/swap).
         victims = []
+        preserve_pins = []
         for rid, req in self.mars_paused_preserved.items():
             if rid == admit_id or self._mars_request_inflight(req):
                 continue
             mode, waste = self._demote_choice(rid, req)
-            if mode is None:  # 'preserve'-classified: never demote, stays pinned
-                continue
-            victims.append((waste, rid, req, mode))
-        if not victims:
+            if mode is None:  # 'preserve'-classified -> tier-2 last resort only
+                preserve_pins.append((waste, rid, req))
+            else:
+                victims.append((waste, rid, req, mode))
+        # Nothing in the paused-preserve pool: bail only if something is running
+        # (native preemption can handle it). At running==0 fall through to the
+        # tier-3 deadlock backstop, which frees the resumed/skipped KV-holders.
+        if not victims and not preserve_pins and self.running:
             return False
-        # Free cheapest-to-lose first; keep the highest-waste pinned longest.
-        victims.sort(key=lambda x: x[0])
         usage = self.kv_cache_manager.usage
         freed = 0
-        for waste, rid, req, mode in victims:
+        # Tier 1: demote by arrival strategy; cheapest-to-lose first so the
+        # costliest-to-redo stay pinned longest.
+        for waste, rid, req, mode in sorted(victims, key=lambda x: x[0]):
             if pool.get_num_free_blocks() >= blocks_needed:
                 break  # minimum reached
             self._demote(rid, req, mode, waste, usage)
             self.mars_reclaims += 1
             freed += 1
+        # Tier 2 (emergency): preserve-classified pins must be freed too if tier 1
+        # didn't cover the chunk. Preserve was the classified-cheapest mode, but
+        # forced to free now we pick the cheaper of RECOMPUTE vs SWAP per pin on live
+        # contention (the v1 write-through cache already mirrored the KV to host, so
+        # swap-OUT is free and only the reload is priced -- often cheaper than a full
+        # recompute). Cheapest-to-redo first.
+        if pool.get_num_free_blocks() < blocks_needed and preserve_pins:
+            rb, rblk = self._running_contention()
+            scored = []
+            for _, rid, req in preserve_pins:
+                mode, w = self._forced_free_mode(req, rb, rblk)
+                scored.append((w, mode, rid, req))
+            scored.sort(key=lambda x: x[0])
+            for w, mode, rid, req in scored:
+                if pool.get_num_free_blocks() >= blocks_needed:
+                    break
+                self._demote(rid, req, mode, w, usage)
+                self.mars_reclaims += 1
+                freed += 1
+        # Tier 3 (deadlock backstop): nothing running == a true memory deadlock
+        # (vLLM's native running-queue preemption has no victims). The reclaim hook
+        # only fires when admission already failed, so at running==0 we MUST free GPU
+        # blocks regardless of the `blocks_needed` estimate -- which UNDER-counts for
+        # KV-reload admissions (a resumed SWAP request reallocates its whole KV, not
+        # just num_new_tokens), the exact case that otherwise early-returns "enough
+        # free" forever (kvhold>0 but freed=0, the engine spinning at running==0).
+        # Free the resumed/skipped KV-holders via RECOMPUTE -- a definitive GPU free
+        # with no connector/reload dependency (the reload path is often the wedged
+        # one) -- cheapest-to-redo first, up to a batch-step of headroom so a real
+        # prefill/reload fits and running recovers, handing back to normal scheduling.
+        if not self.running:
+            rb, rblk = self._running_contention()
+            bs2 = self._block_size
+            scored = []
+            for rid, req in self._mars_kv_holding_waiting():
+                if rid == admit_id:
+                    continue
+                nb = max(1, (req.num_computed_tokens + bs2 - 1) // bs2)
+                scored.append((self.cost_model.discard_waste(nb, rb, rblk), rid, req))
+            scored.sort(key=lambda x: x[0])
+            target = max(blocks_needed,
+                         self.mars_config.cost_max_ragged_batch // self._block_size)
+            for w, rid, req in scored:
+                if pool.get_num_free_blocks() >= target:
+                    break
+                self._demote(rid, req, PauseMode.RECOMPUTE, w, usage)
+                self.mars_reclaims += 1
+                freed += 1
         if freed:
+            self._mars_reclaim_freed += freed
             logger.info(
                 "[MARS] ondemand reclaim: freed %d preserved-paused req(s) "
                 "(need %d blk) to admit req=%s", freed, blocks_needed, admit_id,
@@ -843,6 +1012,27 @@ class _MARSSchedulerMixin:
         if strat == "recompute":
             return PauseMode.RECOMPUTE, waste
         return None, waste  # 'preserve' (or 'swap' w/o connector): stay pinned
+
+    def _forced_free_mode(self, request, running_batch, running_blocks):
+        """Cheaper of RECOMPUTE vs SWAP for a FORCED free of a preserve-classified
+        pin under memory pressure (tier-2 reclaim in :meth:`_reclaim_ondemand`).
+
+        Preserve was the classified-cheapest mode, but admission pressure forces the
+        KV to be freed anyway -- so choose the cheaper of the two free-the-memory
+        modes on live contention. The v1 write-through CPU-offload cache already
+        mirrored this request's KV to host (swap-OUT is a sunk, policy-independent
+        cost), so SWAP prices only the async reload, which frequently beats a full
+        RECOMPUTE. SWAP wins ties (matching the cost model's swap>recompute order)
+        and is only eligible when a CPU-offload connector is available.
+        """
+        bs = self._block_size
+        num_blocks = max(1, (request.num_computed_tokens + bs - 1) // bs)
+        w_d = self.cost_model.discard_waste(num_blocks, running_batch, running_blocks)
+        if self._swap_available:
+            w_s = self.cost_model.swap_waste(num_blocks, running_batch, running_blocks)
+            if w_s <= w_d:
+                return PauseMode.SWAP, w_s
+        return PauseMode.RECOMPUTE, w_d
 
     def _demote(self, rid, request, mode, waste, usage) -> None:
         # Capture the status BEFORE any branch mutates it: it decides whether the
