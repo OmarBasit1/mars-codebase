@@ -34,6 +34,12 @@ _GPU_PROFILES: dict[str, dict[str, float]] = {
             "cost_swap_a1": 0.084919,  # ms/tok (was 84.9189 us/tok -- 1000x unit bug)
             "per_token_swap_latency": 8.492e-05,  # s/tok
         },
+    "A100": { # Yunzhao: TP2 Qwen2.5-14B-Instruct on A100-40GB
+            "cost_a": 0.001272,
+            "cost_c": 24.987,
+            "cost_swap_a1": 0.020533,  # ms/tok
+            "per_token_swap_latency": 2.053e-05,  # s/tok
+        },
 }
 
 
