@@ -1,0 +1,374 @@
+{
+    "proxy-logs/index-1895-try-1.jsonl": {
+        "name": "agent:0",
+        "api_time": 0.0,
+        "multi_turn": [
+            {
+                "prompt_len": 6965,
+                "output_len": 95,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.063445
+                }
+            },
+            {
+                "prompt_len": 7067,
+                "output_len": 140,
+                "tool": {
+                    "name": "agent:1",
+                    "api_time": 0.022549,
+                    "multi_turn": [
+                        {
+                            "prompt_len": 1673,
+                            "output_len": 176,
+                            "tool": {
+                                "name": "tool",
+                                "api_time": 0.019416
+                            }
+                        },
+                        {
+                            "prompt_len": 1797,
+                            "output_len": 318,
+                            "tool": {
+                                "name": "tool",
+                                "api_time": 0.121072
+                            }
+                        },
+                        {
+                            "prompt_len": 2389,
+                            "output_len": 552,
+                            "tool": {
+                                "name": "tool",
+                                "api_time": 0.037981
+                            }
+                        },
+                        {
+                            "prompt_len": 3159,
+                            "output_len": 300,
+                            "tool": {
+                                "name": "tool",
+                                "api_time": 0.069083
+                            }
+                        },
+                        {
+                            "prompt_len": 3470,
+                            "output_len": 145
+                        }
+                    ]
+                }
+            },
+            {
+                "prompt_len": 7432,
+                "output_len": 143,
+                "tool": {
+                    "name": "agent:4",
+                    "api_time": 0.012709,
+                    "multi_turn": [
+                        {
+                            "prompt_len": 47,
+                            "output_len": 57
+                        }
+                    ]
+                }
+            },
+            {
+                "prompt_len": 7715,
+                "output_len": 71,
+                "tool": {
+                    "name": "agent:4",
+                    "api_time": 0.012787,
+                    "multi_turn": [
+                        {
+                            "prompt_len": 47,
+                            "output_len": 57
+                        }
+                    ]
+                }
+            },
+            {
+                "prompt_len": 7926,
+                "output_len": 118,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.115392
+                }
+            },
+            {
+                "prompt_len": 8213,
+                "output_len": 108,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.090536
+                }
+            },
+            {
+                "prompt_len": 26013,
+                "output_len": 632,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.020801
+                }
+            },
+            {
+                "prompt_len": 26440,
+                "output_len": 548,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.02415
+                }
+            },
+            {
+                "prompt_len": 26592,
+                "output_len": 670,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.019555
+                }
+            },
+            {
+                "prompt_len": 26938,
+                "output_len": 592,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.025999
+                }
+            },
+            {
+                "prompt_len": 27710,
+                "output_len": 120,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.020267
+                }
+            },
+            {
+                "prompt_len": 28078,
+                "output_len": 798,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.023707
+                }
+            },
+            {
+                "prompt_len": 29039,
+                "output_len": 985,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.03289
+                }
+            },
+            {
+                "prompt_len": 29641,
+                "output_len": 878,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.035359
+                }
+            },
+            {
+                "prompt_len": 30705,
+                "output_len": 883,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.02544
+                }
+            },
+            {
+                "prompt_len": 31868,
+                "output_len": 877,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.025022
+                }
+            },
+            {
+                "prompt_len": 32931,
+                "output_len": 884,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.023058
+                }
+            },
+            {
+                "prompt_len": 34001,
+                "output_len": 868,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.026963
+                }
+            },
+            {
+                "prompt_len": 35055,
+                "output_len": 875,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.035984
+                }
+            },
+            {
+                "prompt_len": 36116,
+                "output_len": 1075,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.027108
+                }
+            },
+            {
+                "prompt_len": 36738,
+                "output_len": 933,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.024529
+                }
+            },
+            {
+                "prompt_len": 37270,
+                "output_len": 1912,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.024307
+                }
+            },
+            {
+                "prompt_len": 37820,
+                "output_len": 906,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.026492
+                }
+            },
+            {
+                "prompt_len": 38926,
+                "output_len": 1118,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.022936
+                }
+            },
+            {
+                "prompt_len": 39563,
+                "output_len": 1072,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.023765
+                }
+            },
+            {
+                "prompt_len": 40964,
+                "output_len": 127,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.022612
+                }
+            },
+            {
+                "prompt_len": 41467,
+                "output_len": 1277,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.023991
+                }
+            },
+            {
+                "prompt_len": 41973,
+                "output_len": 852,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.030792
+                }
+            },
+            {
+                "prompt_len": 42998,
+                "output_len": 1913,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.024599
+                }
+            },
+            {
+                "prompt_len": 43593,
+                "output_len": 1585,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.026847
+                }
+            },
+            {
+                "prompt_len": 44285,
+                "output_len": 2650,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.02782
+                }
+            },
+            {
+                "prompt_len": 44876,
+                "output_len": 1035,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.024101
+                }
+            },
+            {
+                "prompt_len": 46135,
+                "output_len": 1267,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.025869
+                }
+            },
+            {
+                "prompt_len": 46628,
+                "output_len": 825,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.026944
+                }
+            },
+            {
+                "prompt_len": 47626,
+                "output_len": 1374,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.025932
+                }
+            },
+            {
+                "prompt_len": 49385,
+                "output_len": 835,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.025862
+                }
+            },
+            {
+                "prompt_len": 50393,
+                "output_len": 714,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.033544
+                }
+            },
+            {
+                "prompt_len": 51252,
+                "output_len": 1097,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.021397
+                }
+            },
+            {
+                "prompt_len": 51689,
+                "output_len": 1529,
+                "tool": {
+                    "name": "tool",
+                    "api_time": 0.022095
+                }
+            },
+            {
+                "prompt_len": 52130,
+                "output_len": 708
+            }
+        ]
+    }
+}
