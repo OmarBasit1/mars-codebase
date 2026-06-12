@@ -36,12 +36,47 @@ class ApiSegment:
             ``api_invoke_interval`` / workload ``completion_tokens``).
         api_exec_time: seconds to wait for the API after this segment
             (``0`` => no API call follows; used for the final segment).
-        api_return_length: #tokens the API injects before the next segment.
+        api_return_length: #tokens injected before the next segment (== the next
+            turn's new-prompt delta length). Used by the cost model / metrics;
+            kept consistent with ``len(injected_token_ids)``.
+        injected_token_ids: The exact token ids to inject on resume (the next
+            turn's new-prompt delta: rewritten output + tool output). When empty,
+            the orchestrator falls back to ``[api_result_token] * max(1,
+            api_return_length)`` (the api_server demo path).
+        sub_agent: When set, this pause spawns a *sub-agent* — a separate request
+            (its own prompt/system prompt + KV cache). The orchestrator first
+            sleeps ``api_exec_time`` (the client-side *pre-launch* delay before the
+            child's first LLM call), then drives the child to completion on the
+            same engine while the parent is parked (KV subject to the MARS policy),
+            then resumes with ``injected_token_ids`` injected. ``None`` => the
+            pause is a plain (simulated) API call (sleep ``api_exec_time`` only).
     """
 
     gen_len: int
     api_exec_time: float = 0.0
     api_return_length: int = 0
+    injected_token_ids: list[int] = field(default_factory=list)
+    sub_agent: "AgentPlan | None" = None
+
+
+@dataclass
+class AgentPlan:
+    """A runnable plan for one agent invocation (a node in the workflow tree).
+
+    Each agent invocation is its own request: it carries its own initial prompt,
+    its own flat segment list (one per turn), and its own MARS metadata
+    (``extra_args``). A segment whose ``sub_agent`` is set references a nested
+    :class:`AgentPlan` that the orchestrator drives as a separate child request.
+    """
+
+    prompt_token_ids: list[int]
+    segments: list[ApiSegment]
+    extra_args: dict[str, Any] | None = None
+    # For reporting/debug only: the agent's name and the original per-turn
+    # ``(prompt_len, output_len)`` from the trace (excludes any appended terminal
+    # segment). Lets the harness compare the realized run against the trace.
+    name: str = ""
+    turn_lens: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -74,6 +109,12 @@ class OrchestratorResult:
     # is the per-pause latency from API-return to first generated token.
     resume_times: list[float] = field(default_factory=list)
     post_resume_first_token_times: list[float] = field(default_factory=list)
+    # Total wall-clock seconds the request spent parked at pauses (simulated API
+    # sleeps + sub-agent runtimes). Measured, since a sub-agent's idle time is not
+    # known a priori; the harness subtracts it for normalized latency.
+    total_pause_wait: float = 0.0
+    # Results of any sub-agent requests this request spawned (in pause order).
+    children: list["OrchestratorResult"] = field(default_factory=list)
 
 
 class ApiOrchestrator:
@@ -157,18 +198,41 @@ class ApiOrchestrator:
             )
             for i in range(n - 1):
                 await proceed.get()  # segment i finished + request parked
+                pause_start = time.perf_counter()
                 seg = segments[i]
-                if simulate and seg.api_exec_time > 0:
+                if seg.sub_agent is not None:
+                    # Sub-agent call: first wait the client-side pre-launch delay
+                    # (functions run before the child's first LLM call), then drive
+                    # the child request (its own prompt/system prompt + KV) to
+                    # completion on the same engine while this request stays parked.
+                    if simulate and seg.api_exec_time > 0:
+                        await asyncio.sleep(seg.api_exec_time)
+                    child = await self.run_request(
+                        request_id=f"{request_id}/{i}",
+                        prompt_token_ids=seg.sub_agent.prompt_token_ids,
+                        segments=seg.sub_agent.segments,
+                        temperature=temperature,
+                        extra_args=seg.sub_agent.extra_args,
+                        simulate=simulate,
+                    )
+                    result.children.append(child)
+                elif simulate and seg.api_exec_time > 0:
                     await asyncio.sleep(seg.api_exec_time)  # simulated API latency
-                # At least one token: the engine rejects empty prompts, so an
-                # API that returns nothing still injects a single resume marker.
-                api_tokens = [self.api_result_token] * max(1, seg.api_return_length)
+                result.total_pause_wait += time.perf_counter() - pause_start
+                # Inject the next turn's new-prompt delta (rewritten output + tool
+                # output). The prior generated output is NOT reused (the scheduler's
+                # resume hook discards its KV); these ids become the fresh prefill.
+                # Fallback (api_server demo): repeat the api_result_token. At least
+                # one token -- the engine rejects empty prompts.
+                inj = list(seg.injected_token_ids) or (
+                    [self.api_result_token] * max(1, seg.api_return_length)
+                )
+                if not inj:
+                    inj = [self.api_result_token]
                 result.resume_times.append(time.perf_counter())
                 result.post_resume_first_token_times.append(0.0)
-                # Inject the API result + params for the next segment; the engine
-                # folds prior output into the prompt, appends these, and resumes.
                 yield StreamingInput(
-                    prompt=TokensPrompt(prompt_token_ids=api_tokens),
+                    prompt=TokensPrompt(prompt_token_ids=inj),
                     sampling_params=self._segment_params(
                         segments[i + 1].gen_len, temperature, extra_args
                     ),

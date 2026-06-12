@@ -1109,7 +1109,28 @@ class _MARSSchedulerMixin:
     def _update_request_as_session(self, session: Request, update) -> None:
         rid = session.request_id
         st = self.mars_state.get(rid)
+        # Discard the just-generated output's KV: in the collected traces the prior
+        # turn's output cannot be reused (it is rewritten as "assistant: ...", tool
+        # params stripped) -- only the prompt PREFIX carries over. Setting
+        # num_computed_tokens back to num_prompt_tokens (== this turn's prompt_len)
+        # makes vLLM's resume-fold keep ZERO output tokens and truncate them, so the
+        # resumed prompt = prompt-prefix + injected delta (deterministic ids). For
+        # PRESERVE this reuses the prompt-prefix KV and prefills only the delta;
+        # RECOMPUTE/SWAP reset num_computed=0 below as before.
+        session.num_computed_tokens = session.num_prompt_tokens
         super()._update_request_as_session(session, update)
+        # vLLM's _update_request_as_session refreshes session.sampling_params but
+        # NOT session.max_tokens, while the length stop-check compares
+        # num_output_tokens (reset to 0 by the resume-fold) against
+        # session.max_tokens. So without this every resumed segment is capped at
+        # the FIRST segment's max_tokens (== segments[0].gen_len), making each turn
+        # generate the wrong length. Apply the per-chunk max_tokens so each turn
+        # generates exactly its own output_len.
+        new_max_tokens = getattr(update, "max_tokens", None)
+        if new_max_tokens is None and update.sampling_params is not None:
+            new_max_tokens = update.sampling_params.max_tokens
+        if new_max_tokens is not None:
+            session.max_tokens = new_max_tokens
         # Resuming -> no longer a preserved-paused candidate.
         self.mars_paused_preserved.pop(rid, None)
         if st is not None and not st.pending_reset:

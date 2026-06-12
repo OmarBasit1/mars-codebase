@@ -2,16 +2,33 @@
 
 The async re-implementation of
 ``mars-codebase/benchmarks/fixed_final_tput_bench_real.py`` (which drove the old
-synchronous ``engine.step`` loop). It reads the original workload JSON format
-(per request a list of segments ``{prompt_tokens, completion_tokens, api_time,
-api_token_length}``), launches the requests concurrently with Poisson arrivals
-via ``AsyncLLM`` + ``ApiOrchestrator`` under a chosen MARS policy, and reports
-throughput / normalized-latency / TTFT metrics (+ an optional per-request CSV).
+synchronous ``engine.step`` loop). It reads the collected multi-agent / ReAct
+trace format: ``--workload`` is ``{log_filename: agent_invocation}`` where each
+invocation is ``{name, api_time, multi_turn:[turn...]}`` and a turn is an LLM task
+(``prompt_len``, ``output_len``) whose optional ``tool`` is either a simulated tool
+call (``{name, api_time}``) or a nested sub-agent (``{name, api_time, multi_turn}``).
+Per-agent shared system-prefix lengths come from a separate ``--agent-prefix``
+file (``agent_prefix_len_dict.json``). Convert the old flat workload with
+``mars.bench.convert_workload``.
+
+Trace fidelity: each agent invocation runs as its own engine request; a sub-agent
+call sleeps the client-side pre-launch delay then parks the parent (KV subject to
+the MARS policy) while the child runs concurrently. A turn's generated output is
+NOT reused as KV (it is rewritten as ``assistant: ...`` with tool params stripped),
+so the scheduler discards the output's KV on resume and the next turn re-prefills
+the prompt growth (``prompt_len[i+1]-prompt_len[i]``); ``tool_output_len`` is thus
+inferred, not stored. Token ids are built so each agent's shared prefix (and an
+invocation's carried-over prompt prefix) reuses the prefix cache (on by default).
+
+Requests launch concurrently with Poisson arrivals; reports throughput /
+normalized-latency / TTFT (+ an optional per-request CSV).
 
 Run (from a neutral cwd):
     CUDA_VISIBLE_DEVICES=0 .../python -m mars.bench.run \
-        --workload .../diverse_oneapi_merged_exp_uniform.json \
-        --model facebook/opt-125m --num-requests 8 --qps 8 --api-policy V
+        --workload .../processed_log_example.json \
+        --agent-prefix .../agent_prefix_len_dict.json \
+        --model facebook/opt-125m --num-requests 8 --qps 8 --api-policy V \
+        --max-model-len 65536
 """
 
 from __future__ import annotations
@@ -23,7 +40,7 @@ import json
 import random
 import tempfile
 import time
-from dataclasses import dataclass
+import zlib
 
 # Drop cwd from sys.path BEFORE importing vllm: launching from mars-codebase
 # (which still contains the old vendored vLLM 0.2.0 under vllm/) would otherwise
@@ -39,60 +56,168 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from mars.config import MarsConfig
-from mars.orchestrator import ApiOrchestrator, ApiSegment, OrchestratorResult
+from mars.orchestrator import (
+    AgentPlan, ApiOrchestrator, ApiSegment, OrchestratorResult,
+)
 from mars.params import MarsApiParams
 from mars.swap import cpu_offload_kv_transfer_config
 
 
-@dataclass
-class RequestPlan:
-    prompt_token_ids: list[int]
-    segments: list[ApiSegment]
-    mars: MarsApiParams
-    api_wait: float  # total simulated API latency (for normalized latency)
+def _has_subturns(tool: dict) -> bool:
+    """A tool dict that carries its own turns is a sub-agent (vs. a plain tool)."""
+    return isinstance(tool, dict) and "multi_turn" in tool
 
 
-def build_request_plan(
-    segments_json: list[dict], *, api_policy: str, max_model_len: int,
-    zero_api_time: bool = False,
-) -> RequestPlan:
-    """Map one workload request (list of segments) to a runnable plan."""
-    seg0 = segments_json[0]
-    api_segments = [
-        ApiSegment(
-            gen_len=max(1, int(s.get("completion_tokens", 1))),
-            api_exec_time=float(s.get("api_time", 0.0)),
-            api_return_length=int(s.get("api_token_length", 0)),
-        )
-        for s in segments_json
-    ]
-    # The orchestrator pauses after segments[0..n-2]; api params of the last
-    # segment are unused. Count the real API calls BEFORE optionally zeroing the
-    # wait so api_max_calls stays truthful -- ``--zero-api-time`` removes only the
-    # idle wall-clock (the pause/resume still happens), for max-RPS probing.
-    n_calls = sum(1 for s in api_segments[:-1] if s.api_exec_time > 0)
+def load_workload(path: str, prefix_path: str = "") -> tuple[dict[str, int], list[dict]]:
+    """Load a collected-trace workload into ``(agent_prefix_lens, jobs)``.
+
+    The workload file is a dict ``{log_filename: agent_invocation}`` where each
+    value is ``{name, api_time, multi_turn:[turn...]}``; ``jobs`` is its values.
+    ``agent_prefix_lens`` maps the (prefixed) agent name -> shared system-prefix
+    token length, read from ``prefix_path`` (default: a sibling
+    ``agent_prefix_len_dict.json`` next to the workload).
+    """
+    workload = json.load(open(path))
+    jobs = list(workload.values())
+    if not prefix_path:
+        cand = os.path.join(os.path.dirname(os.path.abspath(path)),
+                            "agent_prefix_len_dict.json")
+        prefix_path = cand if os.path.exists(cand) else ""
+    prefix_lens = json.load(open(prefix_path)) if prefix_path else {}
+    return prefix_lens, jobs
+
+
+def _tok(stream_id: tuple, pos: int, vocab: int) -> int:
+    """Deterministic dummy token id in ``[10, vocab)`` for ``(stream_id, pos)``.
+
+    Identical ``(stream_id, pos)`` always maps to the same id (process-independent),
+    so two token sequences sharing a prefix produce identical ids -> the engine's
+    prefix cache reuses them. ``stream_id`` is ``("agent", name)`` for the shared
+    system-prefix region (same across all invocations of that agent type) and
+    ``("inv", k)`` for an invocation's unique body (stable across its own turns).
+    """
+    h = zlib.adler32(repr(stream_id).encode())
+    span = max(2, vocab - 10)
+    return 10 + ((h * 1103515245 + pos * 12345) & 0x7FFFFFFF) % span
+
+
+def _agent_token_seq(name: str, prefix_len: int, total_len: int,
+                     inv_idx: int, vocab: int) -> list[int]:
+    """Token ids for one agent invocation: shared agent prefix + unique body.
+
+    Positions ``[0, prefix_len)`` use the agent-shared stream (so all invocations
+    of ``name`` share that prefix); positions ``[prefix_len, total_len)`` use this
+    invocation's unique stream. Slicing ``seq[:prompt_len[i]]`` yields each turn's
+    prompt, and earlier slices are exact prefixes of later ones.
+    """
+    out = []
+    for pos in range(total_len):
+        sid = ("agent", name) if pos < prefix_len else ("inv", inv_idx)
+        out.append(_tok(sid, pos, vocab))
+    return out
+
+
+def build_agent_plan(
+    job: dict, prefix_lens: dict[str, int], counter: list[int], *,
+    api_policy: str, vocab: int, zero_api_time: bool = False,
+) -> AgentPlan:
+    """Map one agent invocation (``{name, api_time, multi_turn:[...]}``) to a plan.
+
+    One segment per turn (``gen_len == output_len``). A turn's ``tool.api_time`` is
+    the pause sleep (plain tool) or the sub-agent pre-launch delay; a tool carrying
+    ``multi_turn`` recurses into a nested :class:`AgentPlan`. Since ``tool_output_len``
+    is dropped from the trace, the tokens injected on the pause after turn ``i`` are
+    the prompt growth ``prompt_len[i+1] - prompt_len[i]`` (rewritten output + tool
+    output), taken as the next slice of this invocation's deterministic token
+    sequence so the prefix cache reuses the carried-over prompt prefix.
+    """
+    name = job["name"]
+    turns = job["multi_turn"]
+    inv_idx = counter[0]
+    counter[0] += 1
+
+    prompt_lens = [max(1, int(t.get("prompt_len", 1))) for t in turns]
+    prefix_len = int(prefix_lens.get(name, 0))
+    total_len = max(prompt_lens)
+    seq = _agent_token_seq(name, prefix_len, total_len, inv_idx, vocab)
+
+    segments: list[ApiSegment] = []
+    n_calls = 0  # number of tool pauses (API + sub-agent), == api_max_calls
+    for i, t in enumerate(turns):
+        seg = ApiSegment(gen_len=max(1, int(t["output_len"])))
+        tool = t.get("tool")
+        if tool is not None:
+            seg.api_exec_time = float(tool.get("api_time", 0.0))
+            if _has_subturns(tool):  # sub-agent: api_time = pre-launch delay
+                seg.sub_agent = build_agent_plan(
+                    tool, prefix_lens, counter, api_policy=api_policy,
+                    vocab=vocab, zero_api_time=zero_api_time,
+                )
+            n_calls += 1
+        # Tokens injected at the pause after turn i = the prompt growth into turn
+        # i+1 (>=1). The final turn has no following turn -> no injection.
+        if i + 1 < len(turns):
+            delta = max(1, prompt_lens[i + 1] - prompt_lens[i])
+            seg.injected_token_ids = seq[prompt_lens[i]:prompt_lens[i] + delta]
+            seg.api_return_length = len(seg.injected_token_ids)
+        segments.append(seg)
+    # The orchestrator pauses after segments[0..n-2] only; if the final turn has a
+    # tool (no following turn to inject into), append a minimal terminal segment so
+    # its pause/sub-agent is still realized.
+    if segments and turns[-1].get("tool") is not None:
+        segments.append(ApiSegment(gen_len=1))
+
     if zero_api_time:
-        for s in api_segments:
+        for s in segments:
             s.api_exec_time = 0.0
-    # api_wait = simulated latency of the realized pauses (0 when zeroed).
-    api_wait = sum(s.api_exec_time for s in api_segments[:-1] if s.api_exec_time > 0)
 
-    out_total = sum(s.gen_len for s in api_segments)
-    prompt_tokens = int(seg0.get("prompt_tokens", 1))
-    prompt_tokens = max(1, min(prompt_tokens, max_model_len - out_total - 1))
-    prompt_ids = list(range(10, 10 + prompt_tokens))
-
+    prompt_ids = seq[:prompt_lens[0]]
     mars = MarsApiParams(
         use_api_simulator=True,
-        api_invoke_interval=api_segments[0].gen_len,
-        api_return_length=api_segments[0].api_return_length,
-        api_exec_time=api_segments[0].api_exec_time,
-        predicted_api_exec_time=api_segments[0].api_exec_time,
+        api_invoke_interval=segments[0].gen_len,
+        api_return_length=segments[0].api_return_length,
+        api_exec_time=segments[0].api_exec_time,
+        predicted_api_exec_time=segments[0].api_exec_time,
         api_max_calls=n_calls,
-        remain_length=sum(s.gen_len for s in api_segments[1:]),
+        remain_length=sum(s.gen_len for s in segments[1:]),
         api_policy=api_policy,
     )
-    return RequestPlan(prompt_ids, api_segments, mars, api_wait)
+    turn_lens = [(prompt_lens[i], max(1, int(turns[i]["output_len"])))
+                 for i in range(len(turns))]
+    return AgentPlan(prompt_ids, segments, mars.to_extra_args(),
+                     name=name, turn_lens=turn_lens)
+
+
+def _generated_with_children(r: OrchestratorResult) -> int:
+    """Total model-generated tokens of ``r`` plus all (recursive) sub-agents."""
+    return r.total_generated + sum(_generated_with_children(c) for c in r.children)
+
+
+def _dump_turns(plan: AgentPlan, result: OrchestratorResult, depth: int = 0) -> list[str]:
+    """Per-turn realized-vs-trace report for one request (recurses sub-agents).
+
+    For each turn shows the fed prompt length (initial prompt + injected deltas of
+    earlier turns, with the prior decoded output discarded) vs the trace
+    ``prompt_len``, and the tokens the engine generated vs the trace ``output_len``.
+    """
+    pad = "  " * depth
+    lines = [f"{pad}{result.request_id}  {plan.name}  ({len(plan.turn_lens)} turns)",
+             f"{pad}  turn | prompt_len(fed/trace) |  output(gen/trace)"]
+    child_i = 0
+    fed = len(plan.prompt_token_ids)  # prompt fed at turn 0
+    for i, (tp, to) in enumerate(plan.turn_lens):
+        gen = len(result.segment_tokens[i]) if i < len(result.segment_tokens) else 0
+        pmark = "" if fed == tp else "  <-- MISMATCH"
+        omark = "" if gen == to else ("  (+%d overrun)" % (gen - to) if gen > to else "  <-- SHORT")
+        lines.append(f"{pad}  {i:4d} | {fed:7d} / {tp:7d}{'':6}| {gen:6d} / {to:6d}{omark}{pmark}")
+        # advance the fed prompt length by this turn's injected delta (next prompt)
+        if i < len(plan.segments):
+            fed += len(plan.segments[i].injected_token_ids)
+        seg = plan.segments[i] if i < len(plan.segments) else None
+        if seg is not None and seg.sub_agent is not None and child_i < len(result.children):
+            lines += _dump_turns(seg.sub_agent, result.children[child_i], depth + 1)
+            child_i += 1
+    return lines
 
 
 def _pct(values: list[float], q: float) -> float:
@@ -100,13 +225,12 @@ def _pct(values: list[float], q: float) -> float:
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    workload = json.load(open(args.workload))
-    keys = list(workload.keys())
+    prefix_lens, jobs = load_workload(args.workload, args.agent_prefix)
     random.seed(args.seed)
     # --window W (seconds) derives the request count from the arrival rate, like
     # the original benchmark; otherwise use --num-requests directly.
     num_requests = max(1, int(args.qps * args.window)) if args.window > 0 else args.num_requests
-    selected = random.choices(keys, k=num_requests)
+    selected = random.choices(jobs, k=num_requests)
     rng = np.random.default_rng(args.seed)
     offsets = np.cumsum(rng.exponential(1.0 / args.qps, size=num_requests))
 
@@ -141,6 +265,11 @@ async def main_async(args: argparse.Namespace) -> None:
             per_req_stats_path=stats_path,
         ).to_additional_config(),
     )
+    if args.hf_overrides:
+        # e.g. extend context via YaRN:
+        #   --hf-overrides '{"rope_parameters": {"factor": 8.0,
+        #     "original_max_position_embeddings": 32768, "rope_type": "yarn"}}'
+        eng_kwargs["hf_overrides"] = json.loads(args.hf_overrides)
     want_swap = args.swap
     if want_swap:
         # vLLM's SimpleCPUOffloadConnector is unsupported for hybrid (Mamba/SSM)
@@ -165,33 +294,45 @@ async def main_async(args: argparse.Namespace) -> None:
         eng_kwargs["enable_prefix_caching"] = True
         eng_kwargs["kv_transfer_config"] = cpu_offload_kv_transfer_config(args.cpu_gb)
     else:
-        eng_kwargs["enable_prefix_caching"] = args.prefix_cache
+        # Prefix caching is ON by default: the collected traces reuse each agent's
+        # shared system prefix across invocations and the carried-over prompt prefix
+        # across turns (see build_agent_plan's deterministic token sequences).
+        eng_kwargs["enable_prefix_caching"] = not args.no_prefix_cache
     engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**eng_kwargs))
 
+    vocab = engine.model_config.get_vocab_size()
+    counter = [0]  # global invocation index -> unique body token ids per agent run
     plans = [
-        build_request_plan(workload[k], api_policy=args.api_policy,
-                           max_model_len=args.max_model_len,
-                           zero_api_time=args.zero_api_time)
-        for k in selected
+        build_agent_plan(job, prefix_lens, counter, api_policy=args.api_policy,
+                         vocab=vocab, zero_api_time=args.zero_api_time)
+        for job in selected
     ]
+    # Root agent pre-launch delay (client-side, before its first LLM call).
+    root_api_times = [float(job.get("api_time", 0.0)) for job in selected]
     arrivals: dict[str, float] = {}
     t0 = time.perf_counter()
 
-    async def drive(i: int, plan: RequestPlan):
+    async def drive(i: int, plan: AgentPlan):
         wait = (t0 + float(offsets[i])) - time.perf_counter()
         if wait > 0:
             await asyncio.sleep(wait)
+        # Client-side pre-launch delay before the root agent's first LLM call.
+        if not args.zero_api_time and root_api_times[i] > 0:
+            await asyncio.sleep(root_api_times[i])
         arrivals[str(i)] = time.perf_counter()
         orch = ApiOrchestrator(engine, api_result_token=args.api_token)
+        # --window>0 caps each request at 2*window; the --num-requests path has no
+        # window so run untimed (a 0s timeout would abort every request instantly).
+        timeout = float(args.window) * 2 if args.window > 0 else None
         try:
             return await asyncio.wait_for(
                 orch.run_request(
                     request_id=str(i),
                     prompt_token_ids=plan.prompt_token_ids,
                     segments=plan.segments,
-                    extra_args=plan.mars.to_extra_args(),
+                    extra_args=plan.extra_args,
                 ),
-                timeout=float(args.window) * 2,
+                timeout=timeout,
             )
         except (asyncio.TimeoutError, asyncio.CancelledError):
             return OrchestratorResult(
@@ -201,6 +342,11 @@ async def main_async(args: argparse.Namespace) -> None:
     results = await asyncio.gather(*(drive(i, p) for i, p in enumerate(plans)))
     wall = time.perf_counter() - t0
     engine.shutdown()
+
+    if args.dump_turns and results:
+        print("=" * 56)
+        print("PER-TURN realized-vs-trace (request 0):")
+        print("\n".join(_dump_turns(plans[0], results[0])))
 
     # Read per-request MARS stats written by the scheduler into the sidecar JSONL.
     req_mars: dict[str, dict] = {}
@@ -221,7 +367,8 @@ async def main_async(args: argparse.Namespace) -> None:
 
     # --- metrics ---
     finished = [r for r in results if r.finished]
-    total_gen = sum(r.total_generated for r in finished)
+    # Throughput counts sub-agent tokens too (each agent is a real engine sequence).
+    total_gen = sum(_generated_with_children(r) for r in finished)
     norm_lat, ttft, e2e = [], [], []
     total_input = 0  # prefill tokens over finished requests (for input_tokens_per_s)
     rows = []
@@ -230,7 +377,7 @@ async def main_async(args: argparse.Namespace) -> None:
         e2e_i = r.end_time - arr
         ttft_i = (r.first_token_time - arr) if r.first_token_time else float("nan")
         nl_i = (
-            (r.end_time - arr - plan.api_wait) / r.total_generated
+            (r.end_time - arr - r.total_pause_wait) / r.total_generated
             if r.total_generated
             else float("nan")
         )
@@ -257,7 +404,7 @@ async def main_async(args: argparse.Namespace) -> None:
         if r.finished:
             total_input += input_toks
         rows.append([r.request_id, r.finished, r.pauses, r.total_generated,
-                     f"{plan.api_wait:.4f}", f"{e2e_i:.4f}", f"{ttft_i:.4f}", f"{nl_i:.6f}",
+                     f"{r.total_pause_wait:.4f}", f"{e2e_i:.4f}", f"{ttft_i:.4f}", f"{nl_i:.6f}",
                      mars_rec.get("policy", ""),
                      mars_rec.get("arrival_strategy", ""),
                      mars_rec.get("swap_reloads", ""),
@@ -311,7 +458,11 @@ async def main_async(args: argparse.Namespace) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="MARS async benchmark (vLLM v1).")
-    ap.add_argument("--workload", required=True)
+    ap.add_argument("--workload", required=True,
+                    help="trace JSON: {log_filename: {name, api_time, multi_turn:[...]}}")
+    ap.add_argument("--agent-prefix", default="",
+                    help="agent_prefix_len_dict.json (agent name -> shared system-prefix "
+                         "token length); default: sibling file next to --workload")
     ap.add_argument("--model", default="facebook/opt-125m")
     ap.add_argument("--num-requests", type=int, default=8)
     ap.add_argument("--window", type=float, default=0.0,
@@ -339,9 +490,17 @@ def main() -> None:
                          "count; removes only idle wall-clock) -- for max-RPS probing")
     ap.add_argument("--swap", action="store_true", help="enable SimpleCPUOffloadConnector")
     ap.add_argument("--cpu-gb", type=float, default=4.0)
-    ap.add_argument("--prefix-cache", action="store_true")
+    ap.add_argument("--no-prefix-cache", action="store_true",
+                    help="disable prefix caching (on by default: the traces reuse each "
+                         "agent's shared system prefix and the carried-over prompt prefix)")
     ap.add_argument("--load-format", default="auto", help="e.g. 'dummy' for no download")
-    ap.add_argument("--max-model-len", type=int, default=2048)
+    ap.add_argument("--max-model-len", type=int, default=2048,
+                    help="raise this for long traces (prompt_len can be tens of thousands)")
+    ap.add_argument("--tensor-parallel-size", type=int, default=1,
+                    help="shard the model across N GPUs (set CUDA_VISIBLE_DEVICES too)")
+    ap.add_argument("--hf-overrides", default="",
+                    help="JSON dict passed as AsyncEngineArgs(hf_overrides=...), e.g. YaRN "
+                         "rope scaling to extend context beyond the model's native limit")
     ap.add_argument("--max-num-seqs", type=int, default=256,
                     help="max concurrent sequences (vLLM default auto-sizes to ~128)")
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -349,6 +508,8 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--api-token", type=int, default=5000)
     ap.add_argument("--csv", default="")
+    ap.add_argument("--dump-turns", action="store_true",
+                    help="print a per-turn realized-vs-trace table for request 0")
     args = ap.parse_args()
     asyncio.run(main_async(args))
 
