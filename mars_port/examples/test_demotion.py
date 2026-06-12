@@ -57,7 +57,7 @@ async def main() -> None:
             enable_prefix_caching=False,
             scheduler_cls="mars.v1.scheduler.MARSScheduler",
             additional_config=MarsConfig(
-                api_policy="V", demote_pressure_threshold=0.5
+                api_policy="V", demote_paused=True
             ).to_additional_config(),
         )
     )

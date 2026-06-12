@@ -37,34 +37,46 @@ def _sjf_key(request: Request) -> float:
     return float("inf")
 
 
-def _mem_time(num_blocks: int, running_batch: int, max_ragged_batch: int) -> float:
-    """Memory-time of computing ``num_blocks`` (ported from policy.py V2).
+def _mem_time(
+    num_blocks: int,
+    running_batch: int,
+    max_ragged_batch: int,
+    a: float,
+    c: float,
+    bs: int = _BS,
+) -> float:
+    """Memory-time (token-seconds) of computing ``num_blocks``.
 
-    ``max_ragged_batch`` is the per-step token budget where compute saturates
-    (read from ``vllm_config.scheduler_config.max_num_batched_tokens``).
+    Uses the **profiled** forward coefficients (``a`` ms/tok, ``c`` ms/step) so the
+    V2 ordering score is on the same calibrated scale as ``cost_model`` -- the
+    original's hand-tuned ``a=0.1, c=10`` are no longer used. ``max_ragged_batch``
+    is the per-step token budget where compute saturates.
     """
     c_h = max(max_ragged_batch - running_batch, 1)
-    n = max((_BS * num_blocks + c_h - 1) // c_h, 1)
-    f_s = (0.1 * max_ragged_batch + 10) / 1000
+    n = max((bs * num_blocks + c_h - 1) // c_h, 1)
+    f_s = (a * max_ragged_batch + c) / 1000
     return f_s * (1 + n) * n / 2 * c_h
 
 
-def _make_v2_key(max_ragged_batch: int) -> Callable[[Request], float]:
-    """Return a V2 insertion-key function for the given ``max_ragged_batch``.
+def _make_v2_key(
+    max_ragged_batch: int, a: float, c: float, bs: int = _BS
+) -> Callable[[Request], float]:
+    """Return a V2 insertion-key function (preserve-strategy placeholder score).
 
-    Uses the ``preserve``-strategy score with ``running_batch=0`` as a cheap
-    placeholder; the scheduler overwrites this with a live rekey each step.
+    Uses ``running_batch=0`` as a cheap placeholder; the scheduler overwrites this
+    with a live rekey each step. Uses the profiled ``a``/``c`` so it matches the
+    scheduler's ``_v2_score`` scale.
     """
     def _v2_key(request: Request) -> float:
         mp = MarsApiParams.from_sampling_params(request.sampling_params)
         if mp is None:
             return float("inf")
         prompt_len = getattr(request, "num_prompt_tokens", 0) or 0
-        before_blocks = (prompt_len + mp.predicted_api_invoke_interval + _BS - 1) // _BS
-        after_blocks = (mp.predicted_api_invoke_interval + mp.api_return_length + _BS - 1) // _BS
-        before = _mem_time(before_blocks, 0, max_ragged_batch)
-        after = _mem_time(after_blocks, 0, max_ragged_batch)
-        api_memory = before_blocks * _BS * mp.predicted_api_exec_time
+        before_blocks = (prompt_len + mp.predicted_api_invoke_interval + bs - 1) // bs
+        after_blocks = (mp.predicted_api_invoke_interval + mp.api_return_length + bs - 1) // bs
+        before = _mem_time(before_blocks, 0, max_ragged_batch, a, c, bs)
+        after = _mem_time(after_blocks, 0, max_ragged_batch, a, c, bs)
+        api_memory = before_blocks * bs * mp.predicted_api_exec_time
         return before + api_memory + after
     return _v2_key
 
@@ -172,18 +184,28 @@ class V2RequestQueue(_MarsHeapQueue):
     the insertion-time placeholder score (overwritten by rekey each step anyway).
     """
 
-    def __init__(self, starving: set[str] | None = None, max_ragged_batch: int = 384) -> None:
-        super().__init__(_make_v2_key(max_ragged_batch), starving)
+    def __init__(
+        self,
+        starving: set[str] | None = None,
+        max_ragged_batch: int = 384,
+        a: float = 0.0463,
+        c: float = 10.0,
+        bs: int = _BS,
+    ) -> None:
+        super().__init__(_make_v2_key(max_ragged_batch, a, c, bs), starving)
 
 
 def make_mars_queue(
     policy_config: str,
     starving: set[str] | None = None,
     max_ragged_batch: int = 384,
+    a: float = 0.0463,
+    c: float = 10.0,
+    bs: int = _BS,
 ) -> RequestQueue | None:
     """Return a MARS queue for ``policy_config``, or ``None`` to keep native FCFS."""
     if policy_config == "sjf":
         return MARSRequestQueue(starving)
     if policy_config == "V2":
-        return V2RequestQueue(starving, max_ragged_batch)
+        return V2RequestQueue(starving, max_ragged_batch, a, c, bs)
     return None

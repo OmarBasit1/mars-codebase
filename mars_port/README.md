@@ -40,7 +40,6 @@ MARS_derivative/
     │   │   ├── test_vulcan_classify.py# E2E: V strategy assigned at arrival
     │   │   ├── test_swap.py           # E2E: P/S/D byte-identical with CPU offload
     │   │   ├── test_demotion.py       # E2E: KV demotion under memory pressure
-    │   │   ├── test_proactive_preload.py # E2E: proactive preload byte-identical guard
     │   │   ├── test_cost_model_2way.py   # Unit: preserve/recompute crossover (no GPU)
     │   │   ├── test_cost_model_3way.py   # Unit: 3-way cost model with swap (no GPU)
     │   │   ├── test_classify_v2.py       # Unit: classify at arrival + V2 ordering (no GPU)
@@ -174,7 +173,6 @@ Six end-to-end tests require a GPU; six unit tests require only the `mars` packa
 | `test_vulcan_classify.py` | yes | V assigns strategy at arrival from predicted API time, not at pause |
 | `test_swap.py` | yes | P, S, D produce byte-identical output with the CPU-offload connector |
 | `test_demotion.py` | yes | Dynamic KV demotion fires under memory pressure; all requests finish |
-| `test_proactive_preload.py` | yes | Proactive preload ON/OFF produces byte-identical output |
 | `test_cost_model_2way.py` | no | Preserve/recompute crossover is monotonic; `w_d` is API-time-independent |
 | `test_cost_model_3way.py` | no | 3-way `choose` selects SWAP only when available and cheapest |
 | `test_classify_v2.py` | no | Arrival classify picks correct strategy; V2 reorders queue with live batch |
@@ -228,9 +226,10 @@ Results are written as per-request CSVs to `$OUT/`.
 | `--api-policy` | KV policy: `P` preserve, `D` recompute, `S` swap, `V` Vulcan |
 | `--policy-config` | Queue ordering: `fcfs` (default), `V2` |
 | `--swap` | Enable `SimpleCPUOffloadConnector` (required for S and swap-aware V) |
-| `--chunk-fill` | Enable per-step token budget shaping (also enables demotion) |
+| `--chunk-fill` | Enable per-step token-budget cap (decoupled from demotion) |
 | `--chunk-size N` | Per-step token budget when chunk-fill is on (0 = engine default) |
-| `--no-demote` | Disable dynamic memory-pressure demotion (on by default) |
+| `--no-demote` | Disable dynamic memory-pressure demotion entirely |
+| `--demote-proactive` | Use the original per-step proactive demotion instead of the default on-demand (lazy/minimal) demotion (ablation) |
 | `--starvation-avoidance` | Enable anti-starvation boosting |
 | `--starvation-threshold N` | Steps before a request is boosted |
 | `--starvation-quantum N` | Steps the boost lasts |
@@ -261,7 +260,78 @@ bash MARS_derivative/mars-codebase/exps/run_a40.sh
 | `P` | Preserve | Keep KV blocks pinned; resume immediately |
 | `D` | Discard/Recompute | Free KV; recompute on resume (wastes GPU compute) |
 | `S` | Swap | Free KV to CPU host; reload async on resume |
-| `V` | Vulcan (adaptive) | Classify at arrival (predict P/S/D by cost model); always pause as P; demote every step to cheapest option under memory pressure |
+| `V` | Vulcan (adaptive) | Classify at arrival (predict P/S/D by cost model); always pause as P; demote to the arrival strategy **on-demand** — only the minimum preserved KV freed when a new request can't allocate (best-measured policy; `--demote-proactive` for the original every-step variant) |
+
+---
+
+## Cost model (the `V` waste equations)
+
+`V` classifies each request at arrival by computing three **wastes** and taking the
+argmin (tie-break **preserve > swap > recompute**). Every waste is a
+**GPU-memory × time** quantity in **token-seconds**, so the three are directly
+comparable: each estimates the memory-time a strategy *denies to the rest of the
+system*. The strategy that wins becomes the request's `arrival_strategy` — i.e.
+whether it stays pinned (preserve) or, when on-demand demotion must free memory,
+whether it is demoted to swap or to recompute. Code: [`mars/cost_model.py`](mars/cost_model.py).
+
+**Notation** (coefficients are profiled per GPU/model by `calibrate_cost.py`):
+
+| symbol | meaning |
+|---|---|
+| `B` | the request's KV size, tokens (`block_size · num_blocks` ≈ tokens before the API call) |
+| `T` | predicted API-call duration, seconds (`api_exec_time`) |
+| `R` | KV held by the running batch, tokens (`running_blocks · block_size`) |
+| `M` | `max_ragged_batch` — tokens/step at which the forward becomes compute-bound |
+| `c_h` | prefill headroom this step = `max(M − running_batch, 1)`, tokens/step |
+| `n` | resume/refill iterations = `max(⌈B / c_h⌉ − 1, …)` |
+| `a`, `c` | forward-step time model: one step ≈ `(a·tokens + c)` ms (`a` ms/tok, `c` ms) |
+| `λ` | `per_token_swap_latency` — host→GPU KV reload, s/token |
+
+### Preserve — `w_p = T · B`
+The KV sits **idle on the GPU for the whole API wait**. Cost = its own memory `B`
+held for time `T` — the memory-time that could otherwise have admitted other work.
+(Charged in full; on-demand demotion is what actually reclaims it later if pressure
+arrives, so `w_p` only needs to say "keeping this is cheap iff the wait is short.")
+
+### Recompute / Discard — `w_d` (real compute stolen from the batch)
+```
+c_h = max(M − running_batch, 1)
+n   = max(⌈B / c_h⌉ − 1, 0)
+f_s = (a·M + c)/1000        # one saturated forward step, s
+f_ch = (a·c_h)/1000         # a headroom-sized prefill step, s
+w_d = f_s·(1+n)·n/2·c_h           # cumulative delay to the batch, quadratic in n
+    + f_ch·n·R                    # each of n refill steps delays the running R
+    + f_last·(R + last_resume_toks)   # the final partial chunk (last_resume_toks = B mod c_h)
+```
+Freeing the KV is instant, but on resume the request must **recompute** its `B`
+tokens of prefill in `n` chunks of `c_h`, and that is **real GPU compute** that
+steals iterations from the running batch — hence the term grows with both `n`
+(iterations) and `R` (the memory delayed). This is the genuinely expensive option
+and is unchanged from the original MARS.
+
+### Swap — `w_s` (v1 write-through async reload)
+```
+transfer = λ · B                 # async host→GPU reload time, s
+f_fwd    = (a·M + c)/1000         # one forward step, s
+n        = max(⌈B / c_h⌉ − 1, 1)
+exposed  = max(transfer − f_fwd·n, 0)   # reload time NOT hidden behind compute
+w_s = transfer · B               # own KV resident through its reload
+    + exposed · R                # only the un-hidden remainder stalls the batch
+```
+The CPU-offload connector is **write-through**: every request's KV is mirrored
+GPU→CPU as it is computed, so freeing it (swap-**out**) is a sunk,
+policy-independent cost. Choosing swap therefore only adds the **swap-IN reload**,
+which is **async and overlaps compute** — so unlike the original V0 blocking model
+(a per-iteration stall with swap-out+in contention, `×2`), only the part of the
+reload *not* hidden behind the `n` resume iterations (`exposed`) contends with the
+running batch (`×1`). When the reload hides fully (`exposed = 0`, the common case)
+`w_s` reduces to `λ·B²`, which is small — so swap is the cheapest free-the-memory
+option exactly where it wins. Uses only the profiled `λ` plus the forward
+coefficients; the original `swap_a1/a2/c` magic numbers are retired.
+
+> The swap equation is a **deliberate v1 re-derivation**, not a port of the
+> original. See [COMPARISON.md](COMPARISON.md) → *Swap data-path* for why the V0
+> blocking model (and its ~1000× mis-pricing) does not apply to v1.
 
 ---
 
