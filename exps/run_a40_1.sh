@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# GPU 1 arm of the main MARS bench sweep.
+# Default: async scheduling + CUDA graphs (matches plain vLLM defaults).
+# To reproduce the old eager+sync config: EXTRA="--enforce-eager --sync-scheduling"
 
 PY=${PY:-/export2/obasit/MARS_derivative/vllm/.venv/bin/python}
-WL=${WL:-/export2/obasit/MARS_derivative/mars-codebase/diverse_oneapi_merged_exp_uniform.json}
+WL=${WL:-/export2/obasit/MARS_derivative/mars-codebase/diverse_oneapi_converted.json}
 MODEL=${MODEL:-Qwen/Qwen2.5-14B-Instruct}
-WINDOW=${WINDOW:-150}
-QPS_LIST=${QPS_LIST:-"5 9 13"}    # qps=9 exceeds A40 capacity for MARS (cuBLAS OOM at kv_usage≈1.0)
-OUT=${OUT:-./results/single_api_a40_qwen2.5_14b}
+WINDOW=${WINDOW:-600}
+QPS_LIST=${QPS_LIST:-"5 9"}    # qps=9 near A40 capacity for MARS; monitor kv_usage
+OUT=${OUT:-./results/single_api_a40_qwen2.5_14b_600s_async_graphs}
 GPU=${GPU:-1}
 CPU_GB=${CPU_GB:-32}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
-GPU_MEM=${GPU_MEM:-0.9}  # 0.88 leaves cuBLAS workspace headroom at high KV usage
+GPU_MEM=${GPU_MEM:-0.9}  # fall back to 0.88 if cuBLAS OOM at high KV usage + graphs
 DUMMY=${DUMMY:-0}
 EXTRA=${EXTRA:-}
 SEED=${SEED:-42}        # fixed seed => same workload + arrivals per qps (repeatable)
@@ -35,20 +38,27 @@ run() {  # tag qps policy-flags...
 }
 
 for q in $QPS_LIST; do
-  # MARS (headline): V + V2 + chunk-fill 1024 + swap + starvation. Demotion is
-  # ON-DEMAND by default (lazy/minimal free-on-admission)
-  run MARS_sync "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 2048 --swap \
-      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --sync-scheduling
+  # True vanilla vLLM baseline: stock scheduler, PRESERVE-only (no MARS policy).
+  run Vanilla "$q" --stock-scheduler
 
-  # Vanilla vLLM baseline: discard (recompute) + FCFS.
-  run Discard_sync "$q" --api-policy D --policy-config fcfs --sync-scheduling
-  # Always preserve
-  run Preserve_sync "$q" --api-policy P --policy-config fcfs --sync-scheduling
+  # MARS (headline, no chunk-fill): V + V2 + swap + starvation. Demotion is
+  # ON-DEMAND by default (lazy/minimal free-on-admission).
+  run MARS "$q" --api-policy V --policy-config V2 --swap \
+      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000
 
-  # Always swap
-  run Swap_sync "$q" --api-policy S --policy-config fcfs --swap --sync-scheduling
-  # Always swap, with V2 queue 
-  run Swap_V2_sync "$q" --api-policy S --policy-config V2 --swap --sync-scheduling
+  # MARS with chunk-fill 2048 (isolates the TTFT cost of the token-budget cap).
+  run MARS_chunk2048 "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 2048 --swap \
+      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000
+
+  # MARS eager-drop ablation: frees recompute/swap-classified KV AT THE PAUSE
+  # (--demote-eager) instead of lazy on-demand demotion.
+  run MARS_eager "$q" --api-policy V --policy-config V2 --chunk-fill --chunk-size 2048 --swap \
+      --starvation-avoidance --starvation-threshold 100 --starvation-quantum 100000 --demote-eager
+
+  # Simple baselines: discard (recompute), preserve, swap.
+  run Discard "$q" --api-policy D --policy-config fcfs
+  run Preserve "$q" --api-policy P --policy-config fcfs
+  run Swap "$q" --api-policy S --policy-config fcfs --swap
 done
 
 echo "per-config CSVs written to $OUT/"
