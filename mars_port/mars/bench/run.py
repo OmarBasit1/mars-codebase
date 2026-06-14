@@ -503,7 +503,6 @@ def main() -> None:
                          "rope scaling to extend context beyond the model's native limit")
     ap.add_argument("--max-num-seqs", type=int, default=256,
                     help="max concurrent sequences (vLLM default auto-sizes to ~128)")
-    ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--gpu-mem", type=float, default=0.4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--api-token", type=int, default=5000)
