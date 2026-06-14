@@ -239,19 +239,28 @@ async def main_async(args: argparse.Namespace) -> None:
     _stats_fd, stats_path = tempfile.mkstemp(prefix="mars_req_stats_", suffix=".jsonl")
     os.close(_stats_fd)
 
+    if args.stock_scheduler:
+        print(
+            "[bench] --stock-scheduler: using vLLM's native scheduler "
+            "(pause/resume = PRESERVE-only; --api-policy / --policy-config / "
+            "demotion flags are inert)"
+        )
     eng_kwargs = dict(
         model=args.model,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,  # default False => CUDA graphs ON
         seed=args.seed,  # deterministic engine sampling => repeatable per (qps, seed)
         gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
+        disable_custom_all_reduce=args.disable_custom_all_reduce,
         load_format=args.load_format,
         disable_hybrid_kv_cache_manager=True,
         async_scheduling=not args.sync_scheduling,
-        scheduler_cls="mars.v1.scheduler.MARSScheduler",
-        additional_config=MarsConfig(
+    )
+    if not args.stock_scheduler:
+        eng_kwargs["scheduler_cls"] = "mars.v1.scheduler.MARSScheduler"
+        eng_kwargs["additional_config"] = MarsConfig(
             api_policy=args.api_policy,
             policy_config=args.policy_config,
             chunk_fill=args.chunk_fill,
@@ -263,15 +272,15 @@ async def main_async(args: argparse.Namespace) -> None:
             starvation_threshold=args.starvation_threshold,
             starvation_quantum=args.starvation_quantum,
             per_req_stats_path=stats_path,
-        ).to_additional_config(),
-    )
+        ).to_additional_config()
     if args.hf_overrides:
         # e.g. extend context via YaRN:
         #   --hf-overrides '{"rope_parameters": {"factor": 8.0,
         #     "original_max_position_embeddings": 32768, "rope_type": "yarn"}}'
         eng_kwargs["hf_overrides"] = json.loads(args.hf_overrides)
+    want_connector = args.swap or args.enable_cpu_offload
     want_swap = args.swap
-    if want_swap:
+    if want_connector:
         # vLLM's SimpleCPUOffloadConnector is unsupported for hybrid (Mamba/SSM)
         # models -- the scheduler asserts "External KV connector is not verified"
         # in _mamba_block_aligned_split. Detect that cheaply (config only, no
@@ -290,7 +299,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 want_swap = False
         except Exception as e:  # be permissive -- worst case the engine errors
             print(f"WARNING: hybrid-model probe failed ({e}); proceeding with --swap.")
-    if want_swap:
+    if want_connector:
         eng_kwargs["enable_prefix_caching"] = True
         eng_kwargs["kv_transfer_config"] = cpu_offload_kv_transfer_config(args.cpu_gb)
     else:
@@ -345,8 +354,9 @@ async def main_async(args: argparse.Namespace) -> None:
 
     if args.dump_turns and results:
         print("=" * 56)
-        print("PER-TURN realized-vs-trace (request 0):")
-        print("\n".join(_dump_turns(plans[0], results[0])))
+        print("PER-TURN realized-vs-trace (all requests):")
+        for p, r in zip(plans, results):
+            print("\n".join(_dump_turns(p, r)))
 
     # Read per-request MARS stats written by the scheduler into the sidecar JSONL.
     req_mars: dict[str, dict] = {}
@@ -452,6 +462,9 @@ async def main_async(args: argparse.Namespace) -> None:
                 "input_tokens": total_input,
                 "policy": args.api_policy,
                 "policy_config": args.policy_config,
+                "scheduler": "stock" if args.stock_scheduler else "mars",
+                "enforce_eager": args.enforce_eager,
+                "cpu_offload": want_connector,
             }, sf, indent=2)
         print(f"wrote run summary -> {summary_path}")
 
@@ -488,7 +501,10 @@ def main() -> None:
     ap.add_argument("--zero-api-time", action="store_true",
                     help="zero every segment's API wait (keep pause/resume + call "
                          "count; removes only idle wall-clock) -- for max-RPS probing")
-    ap.add_argument("--swap", action="store_true", help="enable SimpleCPUOffloadConnector")
+    ap.add_argument("--swap", action="store_true", help="enable SimpleCPUOffloadConnector + MARS swap policy")
+    ap.add_argument("--enable-cpu-offload", action="store_true",
+                    help="enable SimpleCPUOffloadConnector without MARS swap policy "
+                         "(lets vLLM use CPU KV for preemption even with --stock-scheduler)")
     ap.add_argument("--cpu-gb", type=float, default=4.0)
     ap.add_argument("--no-prefix-cache", action="store_true",
                     help="disable prefix caching (on by default: the traces reuse each "
@@ -498,6 +514,10 @@ def main() -> None:
                     help="raise this for long traces (prompt_len can be tens of thousands)")
     ap.add_argument("--tensor-parallel-size", type=int, default=1,
                     help="shard the model across N GPUs (set CUDA_VISIBLE_DEVICES too)")
+    ap.add_argument("--disable-custom-all-reduce", action="store_true",
+                    help="fall back to NCCL all-reduce; needed on hosts where the GPUs "
+                         "lack working P2P (e.g. cross-NUMA SYS links) so the custom "
+                         "all-reduce deadlocks. Pair with NCCL_P2P_DISABLE=1.")
     ap.add_argument("--hf-overrides", default="",
                     help="JSON dict passed as AsyncEngineArgs(hf_overrides=...), e.g. YaRN "
                          "rope scaling to extend context beyond the model's native limit")
@@ -509,6 +529,18 @@ def main() -> None:
     ap.add_argument("--csv", default="")
     ap.add_argument("--dump-turns", action="store_true",
                     help="print a per-turn realized-vs-trace table for request 0")
+    ap.add_argument("--enforce-eager", action="store_true",
+                    help="disable CUDA graph capture (enforce_eager=True). By default "
+                         "CUDA graphs are enabled to match plain vLLM's decode speed. "
+                         "Use this to reproduce the old bench config or when graphs "
+                         "are unsupported (hybrid models, tiny GPUs).")
+    ap.add_argument("--stock-scheduler", action="store_true",
+                    help="use vLLM's native scheduler (omit scheduler_cls and "
+                         "MarsConfig). The workload / orchestrator still run normally "
+                         "so pause/resume happens via vLLM's native resumable streaming "
+                         "(PRESERVE-only, no demotion / V / V2 / swap). All --api-policy "
+                         "/ --policy-config / demotion flags are inert. Use for an "
+                         "apples-to-apples MARS-vs-stock comparison inside one harness.")
     args = ap.parse_args()
     asyncio.run(main_async(args))
 

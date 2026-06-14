@@ -83,6 +83,10 @@ class _MarsReqState:
     # Drives the V2 score's ``api_complete`` branch after the final call, like
     # the original's per-call api_max_calls decrement in llm_engine.
     remaining_api_calls: int = 0
+    # Cached MarsApiParams parsed once at arrival; extra_args are fixed after
+    # request construction so this never needs invalidation (only refreshed once
+    # per resume in case sampling_params is replaced by the resume fold).
+    params: "MarsApiParams | None" = None
 
 
 class _MARSSchedulerMixin:
@@ -198,6 +202,18 @@ class _MARSSchedulerMixin:
         # combined_targets.
         self.mars_resumed_preserved: dict[str, Request] = {}
         self.mars_reclaims = 0  # passive_discard invocations
+        # Async-safe deferred pause-time KV free: under async scheduling the pause
+        # fires from update_from_output(N) while batch N+1 may already be dispatched
+        # and referencing these blocks. Record the free here;
+        # _mars_flush_pending_pause_frees applies it once the batch retires (same
+        # root cause as the demotion livelock fixed via _mars_request_inflight, but
+        # at the pause rather than demotion time).
+        self.mars_pending_pause_free: dict[str, Request] = {}
+        # Test hook: MARS_FORCE_DEFER_PAUSE_FREE=N forces the first N pause-frees to
+        # defer even when not in-flight (env var crosses the engine subprocess boundary).
+        self._mars_force_defer: int = int(
+            os.environ.get("MARS_FORCE_DEFER_PAUSE_FREE", "0")
+        )
         # V2 amortization counter (C2): rekey only every rekey_interval steps.
         self._mars_rekey_counter: int = 0
         # Stall diagnostics (enable with env MARS_DIAG=1): a throttled per-second
@@ -225,6 +241,10 @@ class _MARSSchedulerMixin:
 
     def _api_policy_for(self, request: Request) -> str:
         """Per-request ``api_policy`` (extra_args) overriding the engine default."""
+        st = self.mars_state.get(request.request_id)
+        if st is not None:
+            # Fast path: policy letter is set once at classify() time.
+            return st.policy_letter
         mp = MarsApiParams.from_sampling_params(request.sampling_params)
         if mp is not None and mp.api_policy:
             return mp.api_policy
@@ -264,10 +284,17 @@ class _MARSSchedulerMixin:
         every resume by :meth:`_classify_strategy` (faithful to the original
         ``resume_seq_group`` re-running ``classify()``).
         """
-        letter = self._api_policy_for(request)
-        st = _MarsReqState(policy_letter=letter)
-        self.mars_state[request.request_id] = st
+        # Parse once at arrival; store on state so all downstream callers
+        # (_api_policy_for, _classify_strategy, _v2_score) can read the cache
+        # instead of re-parsing sampling_params.extra_args each time.
         mp = MarsApiParams.from_sampling_params(request.sampling_params)
+        letter = (
+            mp.api_policy
+            if mp is not None and mp.api_policy
+            else self.mars_config.api_policy
+        )
+        st = _MarsReqState(policy_letter=letter, params=mp)
+        self.mars_state[request.request_id] = st
         # Seed the remaining-call counter so the V2 ``api_complete`` branch can
         # activate after the final call (the original decrements api_max_calls
         # per completed call in llm_engine; here it lives on the request state).
@@ -286,7 +313,7 @@ class _MARSSchedulerMixin:
         then-current contention), matching the original's per-resume classify.
         """
         letter = st.policy_letter
-        mp = MarsApiParams.from_sampling_params(request.sampling_params)
+        mp = st.params  # use cached params (set at arrival + refreshed on resume)
         if mp is None:
             st.arrival_strategy = "preserve"
             return
@@ -305,7 +332,7 @@ class _MARSSchedulerMixin:
         )
         st.arrival_strategy = _MODE_TO_STRATEGY[mode]
         st.arrival_waste = wastes[mode]
-        logger.info(
+        logger.debug(
             "[MARS] classify req=%s policy=%s -> strategy=%s waste=%.4g (predicted)",
             request.request_id, letter, st.arrival_strategy, st.arrival_waste,
         )
@@ -335,19 +362,31 @@ class _MARSSchedulerMixin:
             self.mars_preserve_count += 1
             if st.policy_letter != "P":
                 self.mars_paused_preserved[request.request_id] = request
-            logger.info(
+            logger.debug(
                 "[MARS] pause req=%s policy=%s mode=preserve (kept KV)%s",
                 request.request_id,
                 st.policy_letter,
                 detail,
             )
             return
-        # SWAP or RECOMPUTE: free the paused request's KV now (idempotent
-        # req_to_blocks.pop) so the GPU memory is available during the API wait.
-        # num_computed_tokens is left intact so the resume-fold can still locate
-        # the kept output tokens; it is reset (and, for RECOMPUTE, the prefix
-        # cache bypassed) after the fold.
-        self.kv_cache_manager.free(request)
+        # SWAP or RECOMPUTE: free the paused request's KV so the GPU memory is
+        # available during the API wait (idempotent req_to_blocks.pop).
+        # Under async scheduling batch N+1 is already dispatched and may still
+        # reference these blocks; defer the physical free to
+        # _mars_flush_pending_pause_frees (next schedule() step, once the batch
+        # retires). The resume-fold semantics depend only on pending_reset /
+        # pending_skip_prefix, which are set unconditionally below — so the deferred
+        # path is semantically identical to the immediate-free path. Sync path is
+        # unchanged (_async_sched is False → never defers).
+        if self._async_sched and (
+            self._mars_request_inflight(request)
+            or self._mars_force_defer > 0
+        ):
+            if self._mars_force_defer > 0:
+                self._mars_force_defer -= 1
+            self.mars_pending_pause_free[request.request_id] = request
+        else:
+            self.kv_cache_manager.free(request)
         st.pending_reset = True
         # For adaptive 'V', freeing KV at the pause IS an eager demotion to the
         # arrival-classified strategy (demote_eager) -- count it like a lazy demotion
@@ -361,7 +400,7 @@ class _MARSSchedulerMixin:
             # Reload the KV from the prefix cache / CPU-offload host on resume.
             st.pending_skip_prefix = False
             self.mars_swap_count += 1
-            logger.info(
+            logger.debug(
                 "[MARS] pause req=%s policy=%s mode=swap (freed KV -> host)%s",
                 request.request_id,
                 st.policy_letter,
@@ -370,7 +409,7 @@ class _MARSSchedulerMixin:
         else:  # RECOMPUTE
             st.pending_skip_prefix = self.mars_config.recompute_skip_prefix_cache
             self.mars_recompute_count += 1
-            logger.info(
+            logger.debug(
                 "[MARS] pause req=%s policy=%s mode=recompute (freed KV)%s",
                 request.request_id,
                 st.policy_letter,
@@ -416,12 +455,62 @@ class _MARSSchedulerMixin:
         )
         return mode, ""
 
+    # --- async deferred KV free -------------------------------------------
+
+    def _mars_flush_pending_pause_frees(self) -> list[Request]:
+        """Apply deferred pause-time KV frees from ``_apply_pause_policy``.
+
+        Under async scheduling a pause fires from ``update_from_output(N)`` while
+        batch N+1 may already be dispatched and still referencing those blocks.
+        The free is deferred to here, called at the top of ``schedule()`` before
+        the base admit loop, so the memory becomes available once the in-flight
+        batch retires.
+
+        Returns a list of requests that were in the *resume-before-free* race
+        (API returned before the batch retired, status is WAITING but blocks are
+        still referenced).  The caller must re-add them to the waiting queue AFTER
+        ``super().schedule()`` to prevent the base from admitting them while their
+        old blocks are still live.
+        """
+        if not self.mars_pending_pause_free:
+            return []
+        deferred_admission: list[Request] = []
+        for rid, req in list(self.mars_pending_pause_free.items()):
+            if rid not in self.requests:
+                # Request finished/aborted: native _free_request already cleaned up.
+                self.mars_pending_pause_free.pop(rid, None)
+                continue
+            if self._mars_request_inflight(req):
+                if req.status == RequestStatus.WAITING:
+                    # Resume-before-free race: the API injected tokens before the
+                    # batch that generated the stop token retired. The request is
+                    # back in the waiting queue, but its old KV blocks are still
+                    # referenced by the unretired batch. Pull it out so the base
+                    # can't admit it this step; the caller re-adds it after
+                    # super().schedule() once the batch has retired.
+                    for queue in (self.waiting, self.skipped_waiting):
+                        try:
+                            queue.remove_request(req)
+                            break
+                        except (ValueError, KeyError):
+                            pass
+                    deferred_admission.append(req)
+                # else: still parked (WAITING_FOR_STREAMING_REQ); wait one more step.
+                continue
+            # Not in-flight: safe to free now.
+            self.kv_cache_manager.free(req)
+            self.mars_pending_pause_free.pop(rid, None)
+        return deferred_admission
+
     # --- V2 ordering + dynamic demotion -----------------------------------
 
     def schedule(self):
         # Pre-pass before the base scheduler admits/preempts:
-        #  0. clean up mars_resumed_preserved for requests that became RUNNING or
-        #     FINISHED since the last step (they were admitted or finished normally).
+        #  0a. flush deferred pause-time KV frees (async scheduling: the in-flight
+        #      batch may still reference blocks freed at the pause step).
+        deferred_admission = self._mars_flush_pending_pause_frees()
+        #  0b. clean up mars_resumed_preserved for requests that became RUNNING or
+        #      FINISHED since the last step (they were admitted or finished normally).
         #  1. starvation — boost long-waiting requests to the front;
         #  2. V2 re-key — re-rank the waiting queue with the live running_batch;
         #  3. demotion — apply the arrival-classified strategy to preserved KV.
@@ -452,6 +541,14 @@ class _MARSSchedulerMixin:
         ):
             self._mars_demote_paused()
         out = super().schedule()
+        # Re-add requests that were temporarily pulled from the queue during the
+        # async deferred-free flush (resume-before-free race: the API returned
+        # before the batch that generated the pause token retired). Now that
+        # super().schedule() has run, the batch is retired and the blocks are free;
+        # re-inserting makes these requests eligible for admission next step.
+        for req in deferred_admission:
+            if req.request_id in self.requests:
+                self.skipped_waiting.prepend_request(req)
         self._mars_diag_heartbeat(out)
         return out
 
@@ -590,7 +687,12 @@ class _MARSSchedulerMixin:
         sorted ``reverse=True`` (== smallest score first); the MARS min-heap pops
         the smallest key first, so we return ``score`` directly.
         """
-        mp = MarsApiParams.from_sampling_params(request.sampling_params)
+        st = self.mars_state.get(request.request_id)
+        mp = (
+            st.params
+            if st is not None and st.params is not None
+            else MarsApiParams.from_sampling_params(request.sampling_params)
+        )
         if mp is None:
             return float("inf")
         bs = self._block_size
@@ -600,7 +702,6 @@ class _MARSSchedulerMixin:
         before = self._mem_time(before_blocks, running_batch)
         after = self._mem_time(after_blocks, running_batch)
         api_exec_time = mp.predicted_api_exec_time
-        st = self.mars_state.get(request.request_id)
         # api_complete tracks the original's per-call api_max_calls decrement:
         # use the live remaining-call counter on the request state (falling back
         # to the static param when no state exists yet).
@@ -1108,6 +1209,14 @@ class _MARSSchedulerMixin:
 
     def _update_request_as_session(self, session: Request, update) -> None:
         rid = session.request_id
+        # Fast path for async-deferred pause-time KV free: if the batch that
+        # generated the pause token has now retired (not in-flight), apply the
+        # deferred free before the resume fold so RECOMPUTE/SWAP start clean.
+        # This covers the resume-before-free race (API returned before the batch
+        # retired) without waiting for the next schedule() flush.
+        if rid in self.mars_pending_pause_free and not self._mars_request_inflight(session):
+            self.kv_cache_manager.free(session)
+            self.mars_pending_pause_free.pop(rid, None)
         st = self.mars_state.get(rid)
         # Discard the just-generated output's KV: in the collected traces the prior
         # turn's output cannot be reused (it is rewritten as "assistant: ...", tool
@@ -1153,13 +1262,17 @@ class _MARSSchedulerMixin:
                 # (WAITING_FOR_REMOTE_KVS overlap) when the request is next admitted.
                 self.mars_swap_reloads += 1
                 st.swap_reloads += 1
-                logger.info(
+                logger.debug(
                     "[MARS] swap reload req=%s (async host->GPU via connector)",
                     session.request_id,
                 )
             st.pending_reset = False
             st.pending_skip_prefix = False
         if st is not None:
+            # Refresh the cached MarsApiParams in case sampling_params was replaced
+            # by the resume fold (the per-segment SamplingParams has a new max_tokens
+            # but the same extra_args; refreshing keeps the cache in sync).
+            st.params = MarsApiParams.from_sampling_params(session.sampling_params)
             # One API call just completed (faithful to the original's per-call
             # api_max_calls decrement) -> the V2 score's api_complete branch can
             # engage for the final segment. Floored at 0.
@@ -1175,6 +1288,7 @@ class _MARSSchedulerMixin:
         st = self.mars_state.pop(request.request_id, None)
         self.mars_paused_preserved.pop(request.request_id, None)
         self.mars_resumed_preserved.pop(request.request_id, None)
+        self.mars_pending_pause_free.pop(request.request_id, None)
         path = self.mars_config.per_req_stats_path
         if path and st is not None:
             # vLLM appends "-{8hex}" to every request_id for internal uniqueness
