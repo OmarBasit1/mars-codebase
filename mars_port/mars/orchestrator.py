@@ -34,8 +34,10 @@ class ApiSegment:
     Attributes:
         gen_len: #tokens to generate in this segment before pausing (the MARS
             ``api_invoke_interval`` / workload ``completion_tokens``).
-        api_exec_time: seconds to wait for the API after this segment
-            (``0`` => no API call follows; used for the final segment).
+        api_exec_time: seconds to wait for the API after this segment.
+            A final segment may still carry tool latency; in that case the
+            latency is realized before the request result returns, but no resume
+            input is injected.
         api_return_length: #tokens injected before the next segment (== the next
             turn's new-prompt delta length). Used by the cost model / metrics;
             kept consistent with ``len(injected_token_ids)``.
@@ -86,7 +88,9 @@ class OrchestratorResult:
     Attributes:
         request_id: The driven request's id.
         finished: True once the request completed (input stream closed).
-        pauses: Number of API pauses observed (== ``len(segments) - 1``).
+        pauses: Number of realized API resumes observed. Terminal tool calls that
+            have no following segment are included in ``total_pause_wait`` but do
+            not increment this counter.
         total_generated: Total model-generated tokens across all segments
             (excludes injected API tokens, which are input).
         segment_tokens: Per-segment lists of generated token ids.
@@ -149,6 +153,38 @@ class ApiOrchestrator:
             extra_args=extra_args,
         )
 
+    async def _run_after_segment_work(
+        self,
+        *,
+        result: OrchestratorResult,
+        request_id: str,
+        segment_index: int,
+        seg: ApiSegment,
+        temperature: float,
+        simulate: bool,
+    ) -> None:
+        """Run API/tool work after one segment, including terminal tools."""
+        pause_start = time.perf_counter()
+        if seg.sub_agent is not None:
+            # Sub-agent call: first wait the client-side pre-launch delay
+            # (functions run before the child's first LLM call), then drive the
+            # child request (its own prompt/system prompt + KV) to completion on
+            # the same engine while this request stays parked when nonterminal.
+            if simulate and seg.api_exec_time > 0:
+                await asyncio.sleep(seg.api_exec_time)
+            child = await self.run_request(
+                request_id=f"{request_id}/{segment_index}",
+                prompt_token_ids=seg.sub_agent.prompt_token_ids,
+                segments=seg.sub_agent.segments,
+                temperature=temperature,
+                extra_args=seg.sub_agent.extra_args,
+                simulate=simulate,
+            )
+            result.children.append(child)
+        elif simulate and seg.api_exec_time > 0:
+            await asyncio.sleep(seg.api_exec_time)
+        result.total_pause_wait += time.perf_counter() - pause_start
+
     async def run_request(
         self,
         *,
@@ -198,27 +234,15 @@ class ApiOrchestrator:
             )
             for i in range(n - 1):
                 await proceed.get()  # segment i finished + request parked
-                pause_start = time.perf_counter()
                 seg = segments[i]
-                if seg.sub_agent is not None:
-                    # Sub-agent call: first wait the client-side pre-launch delay
-                    # (functions run before the child's first LLM call), then drive
-                    # the child request (its own prompt/system prompt + KV) to
-                    # completion on the same engine while this request stays parked.
-                    if simulate and seg.api_exec_time > 0:
-                        await asyncio.sleep(seg.api_exec_time)
-                    child = await self.run_request(
-                        request_id=f"{request_id}/{i}",
-                        prompt_token_ids=seg.sub_agent.prompt_token_ids,
-                        segments=seg.sub_agent.segments,
-                        temperature=temperature,
-                        extra_args=seg.sub_agent.extra_args,
-                        simulate=simulate,
-                    )
-                    result.children.append(child)
-                elif simulate and seg.api_exec_time > 0:
-                    await asyncio.sleep(seg.api_exec_time)  # simulated API latency
-                result.total_pause_wait += time.perf_counter() - pause_start
+                await self._run_after_segment_work(
+                    result=result,
+                    request_id=request_id,
+                    segment_index=i,
+                    seg=seg,
+                    temperature=temperature,
+                    simulate=simulate,
+                )
                 # Inject the next turn's new-prompt delta (rewritten output + tool
                 # output). The prior generated output is NOT reused (the scheduler's
                 # resume hook discards its KV); these ids become the fresh prefill.
@@ -266,5 +290,15 @@ class ApiOrchestrator:
                 proceed.put_nowait(True)
             if out.finished:
                 result.finished = True
+        final_seg = segments[-1]
+        if final_seg.sub_agent is not None or (simulate and final_seg.api_exec_time > 0):
+            await self._run_after_segment_work(
+                result=result,
+                request_id=request_id,
+                segment_index=n - 1,
+                seg=final_seg,
+                temperature=temperature,
+                simulate=simulate,
+            )
         result.end_time = time.perf_counter()
         return result

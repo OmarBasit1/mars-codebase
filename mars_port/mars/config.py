@@ -26,6 +26,33 @@ _GENERIC_COST_DEFAULTS: dict[str, float] = {
     "per_token_swap_latency": 4e-5,
 }
 
+def get_profiles_a100_40gb() -> dict[str, float]:
+    import os
+    RUN_CONFIG = os.getenv("RUN_NAME", "RUN_NAME NOT SET")
+    if RUN_CONFIG == "TP_1_1.5B":
+        return {
+            "cost_a": 0.001272 * 1e19,
+            "cost_c": 24.987 * 1e19,
+            "cost_swap_a1": 0.004933,
+            "per_token_swap_latency": 4.933e-06,
+        }
+    elif RUN_CONFIG == "TP_2_1.5B":
+        return {
+            "cost_a": 0.000606 * 1e19,
+            "cost_c": 16.199 * 1e19,
+            "cost_swap_a1": 0.003007,
+            "per_token_swap_latency": 3.007e-06,
+        }
+    elif RUN_CONFIG == "TP_2_14B":
+        return {
+            "cost_a": 0.001272 * 1e19,
+            "cost_c": 24.987 * 1e19,
+            "cost_swap_a1": 0.020533,
+            "per_token_swap_latency": 2.053e-05,
+        }
+    else:
+        raise ValueError(f"Unknown RUN_CONFIG: {RUN_CONFIG}")
+
 # Per-GPU calibrated overrides.  Matched as substrings of torch device name.
 _GPU_PROFILES: dict[str, dict[str, float]] = {
     "A40": {
@@ -34,12 +61,7 @@ _GPU_PROFILES: dict[str, dict[str, float]] = {
             "cost_swap_a1": 0.084919,  # ms/tok (was 84.9189 us/tok -- 1000x unit bug)
             "per_token_swap_latency": 8.492e-05,  # s/tok
         },
-    "A100": { # Yunzhao: TP2 Qwen2.5-14B-Instruct on A100-40GB
-            "cost_a": 0.001272,
-            "cost_c": 24.987,
-            "cost_swap_a1": 0.020533,  # ms/tok
-            "per_token_swap_latency": 2.053e-05,  # s/tok
-        },
+    "NVIDIA A100-SXM4-40GB": get_profiles_a100_40gb()
 }
 
 

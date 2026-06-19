@@ -23,12 +23,15 @@ invocation's carried-over prompt prefix) reuses the prefix cache (on by default)
 Requests launch concurrently with Poisson arrivals; reports throughput /
 normalized-latency / TTFT (+ an optional per-request CSV).
 
+Native vLLM engine flags can be passed after ``--``; they are parsed by vLLM's
+own ``AsyncEngineArgs`` parser and override the benchmark's mapped defaults.
+
 Run (from a neutral cwd):
     CUDA_VISIBLE_DEVICES=0 .../python -m mars.bench.run \
         --workload .../processed_log_example.json \
         --agent-prefix .../agent_prefix_len_dict.json \
         --model facebook/opt-125m --num-requests 8 --qps 8 --api-policy V \
-        --max-model-len 65536
+        --max-model-len 65536 -- --max-num-batched-tokens 8192
 """
 
 from __future__ import annotations
@@ -61,6 +64,41 @@ from mars.orchestrator import (
 )
 from mars.params import MarsApiParams
 from mars.swap import cpu_offload_kv_transfer_config
+
+
+def split_backend_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    if "--" not in argv:
+        return argv, []
+    idx = argv.index("--")
+    return argv[:idx], argv[idx + 1 :]
+
+
+def _native_flag_present(args: list[str], *flags: str) -> bool:
+    for item in args:
+        for flag in flags:
+            if item == flag or item.startswith(flag + "="):
+                return True
+    return False
+
+
+def _ensure_vllm_parser_platform() -> None:
+    # vLLM's CLI parser may query the current platform. Treat parser-only
+    # commands as CPU-capable so login nodes without visible GPUs still work.
+    from vllm import platforms
+
+    if platforms.current_platform.is_unspecified():
+        from vllm.platforms.cpu import CpuPlatform
+
+        platforms.current_platform = CpuPlatform()
+
+
+def show_backend_help() -> None:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    _ensure_vllm_parser_platform()
+    parser = FlexibleArgumentParser(description="vLLM backend engine arguments")
+    AsyncEngineArgs.add_cli_args(parser)
+    parser.parse_args(["--help"])
 
 
 def _has_subturns(tool: dict) -> bool:
@@ -161,12 +199,6 @@ def build_agent_plan(
             seg.injected_token_ids = seq[prompt_lens[i]:prompt_lens[i] + delta]
             seg.api_return_length = len(seg.injected_token_ids)
         segments.append(seg)
-    # The orchestrator pauses after segments[0..n-2] only; if the final turn has a
-    # tool (no following turn to inject into), append a minimal terminal segment so
-    # its pause/sub-agent is still realized.
-    if segments and turns[-1].get("tool") is not None:
-        segments.append(ApiSegment(gen_len=1))
-
     if zero_api_time:
         for s in segments:
             s.api_exec_time = 0.0
@@ -224,43 +256,63 @@ def _pct(values: list[float], q: float) -> float:
     return float(np.percentile(values, q)) if values else float("nan")
 
 
-async def main_async(args: argparse.Namespace) -> None:
-    prefix_lens, jobs = load_workload(args.workload, args.agent_prefix)
-    random.seed(args.seed)
-    # --window W (seconds) derives the request count from the arrival rate, like
-    # the original benchmark; otherwise use --num-requests directly.
-    num_requests = max(1, int(args.qps * args.window)) if args.window > 0 else args.num_requests
-    selected = random.choices(jobs, k=num_requests)
-    rng = np.random.default_rng(args.seed)
-    offsets = np.cumsum(rng.exponential(1.0 / args.qps, size=num_requests))
-
-    # Sidecar JSONL: the MARS scheduler writes one record per finished request
-    # (policy, arrival_strategy, swap_reloads).  Read after engine.shutdown().
-    _stats_fd, stats_path = tempfile.mkstemp(prefix="mars_req_stats_", suffix=".jsonl")
-    os.close(_stats_fd)
-
+def build_engine_args(
+    args: argparse.Namespace, backend_argv: list[str], stats_path: str
+) -> tuple[AsyncEngineArgs, bool]:
     if args.stock_scheduler:
         print(
             "[bench] --stock-scheduler: using vLLM's native scheduler "
             "(pause/resume = PRESERVE-only; --api-policy / --policy-config / "
             "demotion flags are inert)"
         )
-    eng_kwargs = dict(
-        model=args.model,
-        enforce_eager=args.enforce_eager,  # default False => CUDA graphs ON
-        seed=args.seed,  # deterministic engine sampling => repeatable per (qps, seed)
-        gpu_memory_utilization=args.gpu_mem,
-        max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs,
-        tensor_parallel_size=args.tensor_parallel_size,
-        disable_custom_all_reduce=args.disable_custom_all_reduce,
-        load_format=args.load_format,
-        disable_hybrid_kv_cache_manager=True,
-        async_scheduling=not args.sync_scheduling,
-    )
+
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    _ensure_vllm_parser_platform()
+    parser = FlexibleArgumentParser(description="vLLM backend engine arguments")
+    AsyncEngineArgs.add_cli_args(parser)
+
+    defaults = [
+        "--model",
+        args.model,
+        "--load-format",
+        args.load_format,
+        "--max-model-len",
+        str(args.max_model_len),
+        "--max-num-seqs",
+        str(args.max_num_seqs),
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--gpu-memory-utilization",
+        str(args.gpu_mem),
+        "--seed",
+        str(args.seed),
+    ]
+    if args.enforce_eager:
+        defaults.append("--enforce-eager")
+    if args.disable_custom_all_reduce:
+        defaults.append("--disable-custom-all-reduce")
+    if args.hf_overrides and not _native_flag_present(backend_argv, "--hf-overrides"):
+        defaults.extend(["--hf-overrides", args.hf_overrides])
+    if not _native_flag_present(
+        backend_argv, "--async-scheduling", "--no-async-scheduling"
+    ):
+        defaults.append(
+            "--no-async-scheduling" if args.sync_scheduling else "--async-scheduling"
+        )
+    if not _native_flag_present(
+        backend_argv,
+        "--disable-hybrid-kv-cache-manager",
+        "--no-disable-hybrid-kv-cache-manager",
+    ):
+        defaults.append("--disable-hybrid-kv-cache-manager")
+
+    parsed = parser.parse_args(defaults + backend_argv)
+    engine_args = AsyncEngineArgs.from_cli_args(parsed)
+
     if not args.stock_scheduler:
-        eng_kwargs["scheduler_cls"] = "mars.v1.scheduler.MARSScheduler"
-        eng_kwargs["additional_config"] = MarsConfig(
+        engine_args.scheduler_cls = "mars.v1.scheduler.MARSScheduler"
+        engine_args.additional_config = MarsConfig(
             api_policy=args.api_policy,
             policy_config=args.policy_config,
             chunk_fill=args.chunk_fill,
@@ -273,11 +325,7 @@ async def main_async(args: argparse.Namespace) -> None:
             starvation_quantum=args.starvation_quantum,
             per_req_stats_path=stats_path,
         ).to_additional_config()
-    if args.hf_overrides:
-        # e.g. extend context via YaRN:
-        #   --hf-overrides '{"rope_parameters": {"factor": 8.0,
-        #     "original_max_position_embeddings": 32768, "rope_type": "yarn"}}'
-        eng_kwargs["hf_overrides"] = json.loads(args.hf_overrides)
+
     want_connector = args.swap or args.enable_cpu_offload
     want_swap = args.swap
     if want_connector:
@@ -299,15 +347,45 @@ async def main_async(args: argparse.Namespace) -> None:
                 want_swap = False
         except Exception as e:  # be permissive -- worst case the engine errors
             print(f"WARNING: hybrid-model probe failed ({e}); proceeding with --swap.")
-    if want_connector:
-        eng_kwargs["enable_prefix_caching"] = True
-        eng_kwargs["kv_transfer_config"] = cpu_offload_kv_transfer_config(args.cpu_gb)
-    else:
+
+    native_prefix_override = _native_flag_present(
+        backend_argv, "--enable-prefix-caching", "--no-enable-prefix-caching"
+    )
+    if not native_prefix_override:
         # Prefix caching is ON by default: the collected traces reuse each agent's
         # shared system prefix across invocations and the carried-over prompt prefix
         # across turns (see build_agent_plan's deterministic token sequences).
-        eng_kwargs["enable_prefix_caching"] = not args.no_prefix_cache
-    engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**eng_kwargs))
+        engine_args.enable_prefix_caching = True if want_connector else not args.no_prefix_cache
+
+    native_kv_override = _native_flag_present(
+        backend_argv,
+        "--kv-transfer-config",
+        "--kv-offloading-size",
+        "--kv-offloading-backend",
+    )
+    if want_connector and not native_kv_override:
+        engine_args.kv_transfer_config = cpu_offload_kv_transfer_config(args.cpu_gb)
+
+    return engine_args, want_connector
+
+
+async def main_async(args: argparse.Namespace, backend_argv: list[str]) -> None:
+    prefix_lens, jobs = load_workload(args.workload, args.agent_prefix)
+    random.seed(args.seed)
+    # --window W (seconds) derives the request count from the arrival rate, like
+    # the original benchmark; otherwise use --num-requests directly.
+    num_requests = max(1, int(args.qps * args.window)) if args.window > 0 else args.num_requests
+    selected = random.choices(jobs, k=num_requests)
+    rng = np.random.default_rng(args.seed)
+    offsets = np.cumsum(rng.exponential(1.0 / args.qps, size=num_requests))
+
+    # Sidecar JSONL: the MARS scheduler writes one record per finished request
+    # (policy, arrival_strategy, swap_reloads).  Read after engine.shutdown().
+    _stats_fd, stats_path = tempfile.mkstemp(prefix="mars_req_stats_", suffix=".jsonl")
+    os.close(_stats_fd)
+
+    engine_args, want_connector = build_engine_args(args, backend_argv, stats_path)
+    engine = AsyncLLM.from_engine_args(engine_args)
 
     vocab = engine.model_config.get_vocab_size()
     counter = [0]  # global invocation index -> unique body token ids per agent run
@@ -469,8 +547,13 @@ async def main_async(args: argparse.Namespace) -> None:
         print(f"wrote run summary -> {summary_path}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="MARS async benchmark (vLLM v1).")
+def build_benchmark_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description=(
+            "MARS async benchmark (vLLM v1). Pass native vLLM engine args "
+            "after '--'."
+        )
+    )
     ap.add_argument("--workload", required=True,
                     help="trace JSON: {log_filename: {name, api_time, multi_turn:[...]}}")
     ap.add_argument("--agent-prefix", default="",
@@ -541,8 +624,23 @@ def main() -> None:
                          "(PRESERVE-only, no demotion / V / V2 / swap). All --api-policy "
                          "/ --policy-config / demotion flags are inert. Use for an "
                          "apples-to-apples MARS-vs-stock comparison inside one harness.")
-    args = ap.parse_args()
-    asyncio.run(main_async(args))
+    ap.epilog = (
+        "Example: python -m mars.bench.run --workload workload.json "
+        "--model facebook/opt-125m -- --max-num-batched-tokens 8192"
+    )
+    return ap
+
+
+def main(argv: list[str] | None = None) -> None:
+    bench_argv, backend_argv = split_backend_args(
+        list(sys.argv[1:] if argv is None else argv)
+    )
+    if any(arg in ("-h", "--help") for arg in backend_argv):
+        show_backend_help()
+        return
+    ap = build_benchmark_parser()
+    args = ap.parse_args(bench_argv)
+    asyncio.run(main_async(args, backend_argv))
 
 
 if __name__ == "__main__":
